@@ -1,0 +1,142 @@
+syntax = "proto3";
+
+// Flattened subset of the OpenTelemetry OTLP protocol (metrics + traces).
+//
+// The official OTLP schema is split across many files under
+// opentelemetry/proto/{common,resource,metrics,trace,collector}/v1 with deep
+// cross-imports that fight nanopb's protoc include handling. The protobuf wire
+// format only depends on field numbers and wire types, not on package names or
+// file layout, so this single self-contained file reproduces exactly the field
+// numbers/types we emit. Keep every field number identical to upstream OTLP or
+// collectors will silently drop data.
+//
+// Sizing for the statically-allocated nanopb structs lives in otlp.options.
+package otlp;
+
+// ---------------------------------------------------------------------------
+// common.proto
+// ---------------------------------------------------------------------------
+
+message AnyValue {
+    oneof value {
+        string string_value = 1;
+        bool bool_value = 2;
+        int64 int_value = 3;
+        double double_value = 4;
+    }
+}
+
+message KeyValue {
+    string key = 1;
+    AnyValue value = 2;
+}
+
+message InstrumentationScope {
+    string name = 1;
+    string version = 2;
+}
+
+// ---------------------------------------------------------------------------
+// resource.proto
+// ---------------------------------------------------------------------------
+
+message Resource {
+    repeated KeyValue attributes = 1;
+}
+
+// ---------------------------------------------------------------------------
+// metrics.proto
+// ---------------------------------------------------------------------------
+
+message NumberDataPoint {
+    repeated KeyValue attributes = 7;
+    fixed64 start_time_unix_nano = 2;
+    fixed64 time_unix_nano = 3;
+    oneof value {
+        double as_double = 4;
+        sfixed64 as_int = 6;
+    }
+}
+
+message Gauge {
+    repeated NumberDataPoint data_points = 1;
+}
+
+message Metric {
+    string name = 1;
+    string description = 2;
+    string unit = 3;
+    oneof data {
+        Gauge gauge = 5;
+    }
+}
+
+message ScopeMetrics {
+    InstrumentationScope scope = 1;
+    repeated Metric metrics = 2;
+}
+
+message ResourceMetrics {
+    Resource resource = 1;
+    repeated ScopeMetrics scope_metrics = 2;
+}
+
+// collector/metrics/v1/metrics_service.proto
+message ExportMetricsServiceRequest {
+    repeated ResourceMetrics resource_metrics = 1;
+}
+
+// ---------------------------------------------------------------------------
+// trace.proto
+// ---------------------------------------------------------------------------
+
+enum SpanKind {
+    SPAN_KIND_UNSPECIFIED = 0;
+    SPAN_KIND_INTERNAL = 1;
+    SPAN_KIND_SERVER = 2;
+    SPAN_KIND_CLIENT = 3;
+    SPAN_KIND_PRODUCER = 4;
+    SPAN_KIND_CONSUMER = 5;
+}
+
+message Status {
+    string message = 2;
+    // StatusCode: 0 = UNSET, 1 = OK, 2 = ERROR. int32 shares the varint wire
+    // type with the upstream enum.
+    int32 code = 3;
+}
+
+message SpanEvent {
+    fixed64 time_unix_nano = 1;
+    string name = 2;
+    repeated KeyValue attributes = 3;
+}
+
+message Span {
+    bytes trace_id = 1;
+    bytes span_id = 2;
+    string trace_state = 3;
+    bytes parent_span_id = 4;
+    string name = 5;
+    SpanKind kind = 6;
+    fixed64 start_time_unix_nano = 7;
+    fixed64 end_time_unix_nano = 8;
+    repeated KeyValue attributes = 9;
+    repeated SpanEvent events = 11;
+    Status status = 15;
+}
+
+message ScopeSpans {
+    InstrumentationScope scope = 1;
+    repeated Span spans = 2;
+}
+
+message ResourceSpans {
+    Resource resource = 1;
+    repeated ScopeSpans scope_spans = 2;
+}
+
+// collector/trace/v1/trace_service.proto
+message ExportTraceServiceRequest {
+    repeated ResourceSpans resource_spans = 1;
+}

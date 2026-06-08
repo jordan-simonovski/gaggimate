@@ -577,6 +577,14 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 settings->setHomeAssistantPort(request->arg("haPort").toInt());
             if (request->hasArg("haTopic"))
                 settings->setHomeAssistantTopic(request->arg("haTopic"));
+            settings->setOtelMetrics(request->hasArg("otelMetrics"));
+            settings->setOtelTraces(request->hasArg("otelTraces"));
+            if (request->hasArg("otelEndpoint"))
+                settings->setOtelEndpoint(request->arg("otelEndpoint"));
+            if (request->hasArg("otelHeaders"))
+                settings->setOtelHeaders(request->arg("otelHeaders"));
+            if (request->hasArg("otelInterval"))
+                settings->setOtelInterval(request->arg("otelInterval").toInt());
             settings->setMomentaryButtons(request->hasArg("momentaryButtons"));
             settings->setDelayAdjust(request->hasArg("delayAdjust"));
             if (request->hasArg("brewDelay"))
@@ -682,6 +690,11 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["haIP"] = settings.getHomeAssistantIP();
     doc["haPort"] = settings.getHomeAssistantPort();
     doc["haTopic"] = settings.getHomeAssistantTopic();
+    doc["otelMetrics"] = settings.isOtelMetrics();
+    doc["otelTraces"] = settings.isOtelTraces();
+    doc["otelEndpoint"] = settings.getOtelEndpoint();
+    doc["otelHeaders"] = settings.getOtelHeaders();
+    doc["otelInterval"] = settings.getOtelInterval();
     doc["pid"] = settings.getPid();
     doc["pumpModelCoeffs"] = settings.getPumpModelCoeffs();
     doc["wifiSsid"] = settings.getWifiSsid();

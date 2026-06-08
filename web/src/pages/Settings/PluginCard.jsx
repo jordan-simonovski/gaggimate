@@ -357,6 +357,100 @@ export function PluginCard({
           </div>
         )}
       </div>
+
+      <div className='bg-base-200 rounded-lg p-4'>
+        <span className='text-xl font-medium'>OpenTelemetry</span>
+        <p className='mt-2 text-sm opacity-70'>
+          Export coffee telemetry to an OpenTelemetry (OTLP/HTTP) collector or a public OTLP
+          endpoint. Metrics are periodic gauges (boiler temperature/pressure, pump flow, weight);
+          traces emit one span per shot. Changes apply after a restart.
+        </p>
+
+        <div className='border-base-300 mt-4 space-y-4 border-t pt-4'>
+          <div className='flex items-center justify-between'>
+            <span className='text-sm font-medium'>Export Metrics</span>
+            <input
+              id='otelMetrics'
+              name='otelMetrics'
+              value='otelMetrics'
+              type='checkbox'
+              className='toggle toggle-primary'
+              checked={!!formData.otelMetrics}
+              onChange={onChange('otelMetrics')}
+              aria-label='Enable OpenTelemetry Metrics'
+            />
+          </div>
+          <div className='flex items-center justify-between'>
+            <span className='text-sm font-medium'>Export Traces (per-shot spans)</span>
+            <input
+              id='otelTraces'
+              name='otelTraces'
+              value='otelTraces'
+              type='checkbox'
+              className='toggle toggle-primary'
+              checked={!!formData.otelTraces}
+              onChange={onChange('otelTraces')}
+              aria-label='Enable OpenTelemetry Traces'
+            />
+          </div>
+
+          {(formData.otelMetrics || formData.otelTraces) && (
+            <div className='space-y-4'>
+              <div className='form-control'>
+                <label htmlFor='otelEndpoint' className='mb-2 block text-sm font-medium'>
+                  OTLP/HTTP Endpoint
+                </label>
+                <input
+                  id='otelEndpoint'
+                  name='otelEndpoint'
+                  type='text'
+                  className='input input-bordered w-full'
+                  placeholder='https://otlp.example.com:4318'
+                  value={formData.otelEndpoint}
+                  onChange={onChange('otelEndpoint')}
+                />
+                <p className='mt-1 text-xs opacity-60'>
+                  Base URL only. The signal paths <code>/v1/metrics</code> and{' '}
+                  <code>/v1/traces</code> are appended automatically. <code>https://</code> uses the
+                  built-in CA bundle.
+                </p>
+              </div>
+
+              <div className='form-control'>
+                <label htmlFor='otelHeaders' className='mb-2 block text-sm font-medium'>
+                  Custom Headers
+                </label>
+                <textarea
+                  id='otelHeaders'
+                  name='otelHeaders'
+                  rows='3'
+                  className='textarea textarea-bordered w-full font-mono text-sm'
+                  placeholder={'Authorization: Bearer <token>\nx-api-key: <key>'}
+                  value={formData.otelHeaders}
+                  onChange={onChange('otelHeaders')}
+                />
+                <p className='mt-1 text-xs opacity-60'>One "Header: value" per line.</p>
+              </div>
+
+              <div className='form-control'>
+                <label htmlFor='otelInterval' className='mb-2 block text-sm font-medium'>
+                  Metric Export Interval (s)
+                </label>
+                <input
+                  id='otelInterval'
+                  name='otelInterval'
+                  type='number'
+                  min='1'
+                  className='input input-bordered w-full'
+                  placeholder='10'
+                  value={formData.otelInterval}
+                  onChange={onChange('otelInterval')}
+                />
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

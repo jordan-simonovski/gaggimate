@@ -33,6 +33,11 @@ Settings::Settings() {
     smartGrindIp = preferences.getString("sg_i", "");
     smartGrindToggle = preferences.getBool("sg_t", false);
     smartGrindMode = preferences.getInt("sg_m", smartGrindToggle ? 1 : 0);
+    otelMetrics = preferences.getBool("ot_m", false);
+    otelTraces = preferences.getBool("ot_t", false);
+    otelEndpoint = preferences.getString("ot_ep", "");
+    otelHeaders = preferences.getString("ot_hd", "");
+    otelInterval = preferences.getInt("ot_iv", DEFAULT_OTEL_INTERVAL_S);
     homeAssistant = preferences.getBool("ha_a", false);
     homeAssistantIP = preferences.getString("ha_i", "");
     homeAssistantPort = preferences.getInt("ha_p", 1883);
@@ -260,6 +265,31 @@ void Settings::setSmartGrindIp(String smart_grind_ip) {
 
 void Settings::setSmartGrindMode(int smart_grind_mode) {
     this->smartGrindMode = smart_grind_mode;
+    save();
+}
+
+void Settings::setOtelMetrics(const bool otel_metrics) {
+    otelMetrics = otel_metrics;
+    save();
+}
+
+void Settings::setOtelTraces(const bool otel_traces) {
+    otelTraces = otel_traces;
+    save();
+}
+
+void Settings::setOtelEndpoint(const String &otel_endpoint) {
+    otelEndpoint = otel_endpoint;
+    save();
+}
+
+void Settings::setOtelHeaders(const String &otel_headers) {
+    otelHeaders = otel_headers;
+    save();
+}
+
+void Settings::setOtelInterval(const int otel_interval) {
+    otelInterval = otel_interval;
     save();
 }
 
@@ -502,6 +532,11 @@ void Settings::doSave() {
     preferences.putString("sg_i", smartGrindIp);
     preferences.putBool("sg_t", smartGrindToggle);
     preferences.putInt("sg_m", smartGrindMode);
+    preferences.putBool("ot_m", otelMetrics);
+    preferences.putBool("ot_t", otelTraces);
+    preferences.putString("ot_ep", otelEndpoint);
+    preferences.putString("ot_hd", otelHeaders);
+    preferences.putInt("ot_iv", otelInterval);
     preferences.putBool("ha_a", homeAssistant);
     preferences.putString("ha_i", homeAssistantIP);
     preferences.putInt("ha_p", homeAssistantPort);

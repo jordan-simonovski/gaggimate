@@ -80,6 +80,12 @@ class Settings {
     bool isSmartGrindActive() const { return smartGrindActive; }
     int getSmartGrindMode() const { return smartGrindMode; }
     String getSmartGrindIp() const { return smartGrindIp; }
+    bool isOtelMetrics() const { return otelMetrics; }
+    bool isOtelTraces() const { return otelTraces; }
+    bool isOtelEnabled() const { return otelMetrics || otelTraces; }
+    String getOtelEndpoint() const { return otelEndpoint; }
+    String getOtelHeaders() const { return otelHeaders; }
+    int getOtelInterval() const { return otelInterval; }
     bool isHomeAssistant() const { return homeAssistant; }
     String getHomeAssistantIP() const { return homeAssistantIP; }
     String getHomeAssistantUser() const { return homeAssistantUser; }
@@ -152,6 +158,11 @@ class Settings {
     void setSmartGrindActive(bool smart_grind_active);
     void setSmartGrindIp(String smart_grind_ip);
     void setSmartGrindMode(int smart_grind_mode);
+    void setOtelMetrics(bool otel_metrics);
+    void setOtelTraces(bool otel_traces);
+    void setOtelEndpoint(const String &otel_endpoint);
+    void setOtelHeaders(const String &otel_headers);
+    void setOtelInterval(int otel_interval);
     void setHomeAssistant(bool homeAssistant);
     void setHomeAssistantUser(const String &homeAssistantUser);
     void setHomeAssistantPassword(const String &homeAssistantPassword);
@@ -230,6 +241,11 @@ class Settings {
     bool smartGrindToggle = false;
     int smartGrindMode = 0;
     String smartGrindIp = "";
+    bool otelMetrics = false;
+    bool otelTraces = false;
+    String otelEndpoint = "";
+    String otelHeaders = "";
+    int otelInterval = DEFAULT_OTEL_INTERVAL_S;
     bool homeAssistant = false;
     String homeAssistantUser = "";
     String homeAssistantPassword = "";

@@ -21,6 +21,7 @@
 #include <display/plugins/LedControlPlugin.h>
 #include <display/plugins/MQTTPlugin.h>
 #include <display/plugins/NetworkWatchdogPlugin.h>
+#include <display/plugins/OpenTelemetryPlugin.h>
 #include <display/plugins/ShotHistoryPlugin.h>
 #include <display/plugins/SmartGrindPlugin.h>
 #include <display/plugins/WebUIPlugin.h>
@@ -78,6 +79,9 @@ void Controller::setup() {
     }
     if (settings.isHomeAssistant()) {
         pluginManager->registerPlugin(new MQTTPlugin());
+    }
+    if (settings.isOtelEnabled()) {
+        pluginManager->registerPlugin(new OpenTelemetryPlugin());
     }
     pluginManager->registerPlugin(new WebUIPlugin());
     pluginManager->registerPlugin(new NetworkWatchdogPlugin());

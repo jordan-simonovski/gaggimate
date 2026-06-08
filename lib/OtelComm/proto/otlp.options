@@ -1,0 +1,46 @@
+# nanopb sizing for the OTLP subset. Everything is statically allocated: the
+# telemetry we emit is bounded (a fixed set of gauges, one span per shot), so
+# fixed caps are simpler and safer than malloc/callback fields. The top-level
+# request structs are large (~kB) and are allocated in PSRAM by the encoder,
+# never on the stack.
+
+# Caps are deliberately tight: nanopb encodes each message's field descriptors
+# in 2 bytes, which caps a single message struct at 4096 bytes. Repeated
+# submessages multiply quickly, so keep counts small enough that ScopeMetrics /
+# Span / ResourceSpans each stay under that limit.
+
+# Attribute values: long enough for service.version, profile names, hostnames.
+otlp.AnyValue.string_value max_size:48
+otlp.KeyValue.key max_size:40
+
+otlp.InstrumentationScope.name max_size:24
+otlp.InstrumentationScope.version max_size:24
+
+# Resource identity (service.name/instance.id/version, machine hardware, ...).
+otlp.Resource.attributes max_count:6
+
+# Metrics: one Gauge per Metric, one point per Gauge per export tick. Data
+# points carry no per-point attributes today (identity is the metric name).
+otlp.NumberDataPoint.attributes max_count:1
+otlp.Gauge.data_points max_count:1
+otlp.Metric.name max_size:48
+otlp.Metric.description max_size:2
+otlp.Metric.unit max_size:12
+otlp.ScopeMetrics.metrics max_count:10
+otlp.ResourceMetrics.scope_metrics max_count:1
+otlp.ExportMetricsServiceRequest.resource_metrics max_count:1
+
+# Traces: one span per shot, with optional per-phase events.
+otlp.Status.message max_size:2
+otlp.SpanEvent.name max_size:24
+otlp.SpanEvent.attributes max_count:2
+otlp.Span.trace_id max_size:16
+otlp.Span.span_id max_size:8
+otlp.Span.parent_span_id max_size:8
+otlp.Span.trace_state max_size:2
+otlp.Span.name max_size:32
+otlp.Span.attributes max_count:8
+otlp.Span.events max_count:4
+otlp.ScopeSpans.spans max_count:1
+otlp.ResourceSpans.scope_spans max_count:1
+otlp.ExportTraceServiceRequest.resource_spans max_count:1

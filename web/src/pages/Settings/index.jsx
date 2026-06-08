@@ -172,6 +172,12 @@ export function Settings() {
       if (key === 'homeAssistant') {
         value = !formData.homeAssistant;
       }
+      if (key === 'otelMetrics') {
+        value = !formData.otelMetrics;
+      }
+      if (key === 'otelTraces') {
+        value = !formData.otelTraces;
+      }
       if (key === 'momentaryButtons') {
         value = !formData.momentaryButtons;
       }
