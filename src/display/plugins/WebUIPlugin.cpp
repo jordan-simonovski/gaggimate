@@ -28,6 +28,21 @@ using PsramString = std::basic_string<char, std::char_traits<char>, PsramStlAllo
 static std::unordered_map<uint32_t, PsramString> rxBuffers;
 static WebUIPlugin *g_webUIPlugin = nullptr;
 
+// Build the channel-specific releases URL from a configurable base. The base is
+// a GitHub-style ".../releases/" URL (the OTA discovery in GitHubOTA relies on
+// GitHub's /releases/latest redirect for "latest" and a version.txt under
+// /releases/download/nightly/ for "nightly"). An empty base falls back to the
+// upstream default so a blank setting never bricks updates.
+static String buildReleaseUrl(const String &base, const String &channel) {
+    String url = base;
+    url.trim();
+    if (url.isEmpty())
+        url = DEFAULT_OTA_URL;
+    if (!url.endsWith("/"))
+        url += "/";
+    return url + (channel == "latest" ? "latest" : "tag/nightly");
+}
+
 WebUIPlugin::WebUIPlugin() : server(80), ws("/ws") { g_webUIPlugin = this; }
 
 void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) {
@@ -36,7 +51,7 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
     this->pluginManager = _pluginManager;
     this->ota = new GitHubOTA(
         BUILD_GIT_VERSION, controller->getSystemInfo().version,
-        RELEASE_URL + (controller->getSettings().getOTAChannel() == "latest" ? "latest" : "tag/nightly"),
+        buildReleaseUrl(controller->getSettings().getOtaUrl(), controller->getSettings().getOTAChannel()),
         [this](uint8_t phase) {
             pluginManager->trigger("ota:update:phase", "phase", phase);
             updateOTAProgress(phase, 0);
@@ -418,9 +433,20 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
 
 void WebUIPlugin::handleOTASettings(uint32_t clientId, JsonDocument &request) {
     if (request["update"].as<bool>()) {
+        bool changed = false;
+        if (!request["otaUrl"].isNull()) {
+            String url = request["otaUrl"].as<String>();
+            url.trim();
+            controller->getSettings().setOtaUrl(url.isEmpty() ? DEFAULT_OTA_URL : url);
+            changed = true;
+        }
         if (!request["channel"].isNull()) {
             controller->getSettings().setOTAChannel(request["channel"].as<String>() == "latest" ? "latest" : "nightly");
-            ota->setReleaseUrl(RELEASE_URL + (controller->getSettings().getOTAChannel() == "latest" ? "latest" : "tag/nightly"));
+            changed = true;
+        }
+        if (changed) {
+            ota->setReleaseUrl(
+                buildReleaseUrl(controller->getSettings().getOtaUrl(), controller->getSettings().getOTAChannel()));
             lastUpdateCheck = 0;
         }
     }
@@ -831,6 +857,7 @@ void WebUIPlugin::updateOTAStatus(const String &version) {
     doc["hardware"] = controller->getSystemInfo().hardware;
     doc["latestVersion"] = ota->getCurrentVersion();
     doc["channel"] = settings.getOTAChannel();
+    doc["otaUrl"] = settings.getOtaUrl();
     doc["updating"] = updating;
     // LittleFS usage metrics
     {

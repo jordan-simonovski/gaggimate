@@ -101,7 +101,12 @@ export function OTA() {
       setSubmitting(true);
       const form = formRef.current;
       const formData = new FormData(form);
-      apiService.send({ tp: 'req:ota-settings', update: true, channel: formData.get('channel') });
+      apiService.send({
+        tp: 'req:ota-settings',
+        update: true,
+        channel: formData.get('channel'),
+        otaUrl: formData.get('otaUrl'),
+      });
       setSubmitting(true);
     },
     [setFormData, formRef],
@@ -176,6 +181,25 @@ export function OTA() {
                   Nightly
                 </option>
               </select>
+            </div>
+
+            <div className='flex flex-col space-y-4'>
+              <label htmlFor='otaUrl' className='mb-2 block text-sm font-medium'>
+                Update Source URL
+              </label>
+              <input
+                id='otaUrl'
+                name='otaUrl'
+                type='text'
+                className='input input-bordered w-full'
+                placeholder='https://github.com/jniebuhr/gaggimate/releases/'
+                defaultValue={formData.otaUrl}
+              />
+              <span className='text-xs opacity-60'>
+                GitHub-style releases URL. Point this at your own fork's{' '}
+                <code>/releases/</code> to OTA your own builds. Leave blank to use the official
+                releases.
+              </span>
             </div>
 
             <div className='flex flex-col space-y-4'>
