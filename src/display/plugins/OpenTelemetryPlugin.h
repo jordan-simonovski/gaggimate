@@ -41,8 +41,20 @@ class OpenTelemetryPlugin : public Plugin {
         bool haveWeight = false;
     };
 
+    // One coffee-shot phase, captured live and emitted as a child span of the
+    // parent "shot" span when the brew ends.
+    struct PhaseSpan {
+        String name;
+        String type;
+        int index = 0;
+        uint64_t startNanos = 0;
+        float peakPressure = 0.0f;
+        float peakFlow = 0.0f;
+    };
+
     void onBrewStart();
     void onBrewEnd();
+    void onBrewPhase(int index);
 
     static void exportTaskFn(void *arg);
     void exportLoop();
@@ -79,6 +91,11 @@ class OpenTelemetryPlugin : public Plugin {
     bool shotVolumetric = false;
     String shotProfileLabel;
     String shotProfileType;
+
+    // Per-phase slices for the active shot (guarded by mutex). activePhase is an
+    // index into phases for the currently-open phase, or -1 if none.
+    std::vector<PhaseSpan> phases;
+    int activePhase = -1;
 
     QueueHandle_t spanQueue = nullptr; // holds otel::SpanData*
 

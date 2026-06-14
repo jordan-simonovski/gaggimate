@@ -499,6 +499,14 @@ void Controller::loopLogic() {
             brewProcess->updateFlow(currentPumpFlow);
         }
         currentProcess->progress();
+        if (currentProcess != nullptr && currentProcess->getType() == MODE_BREW) {
+            auto brewProcess = static_cast<BrewProcess *>(currentProcess);
+            if (brewProcess != brewPhaseProcess || static_cast<int>(brewProcess->phaseIndex) != brewPhaseIndex) {
+                brewPhaseProcess = brewProcess;
+                brewPhaseIndex = static_cast<int>(brewProcess->phaseIndex);
+                pluginManager->trigger("controller:brew:phase", "index", brewPhaseIndex);
+            }
+        }
         if (!isActive()) {
             deactivate();
         }

@@ -174,6 +174,11 @@ class Controller {
     Process *currentProcess = nullptr;
     Process *lastProcess = nullptr;
 
+    // Tracks the brew phase last announced on the event bus so loopLogic only
+    // fires "controller:brew:phase" on an actual transition.
+    Process *brewPhaseProcess = nullptr;
+    int brewPhaseIndex = -1;
+
     unsigned long grindActiveUntil = 0;
     unsigned long lastPing = 0;
     unsigned long lastProgress = 0;

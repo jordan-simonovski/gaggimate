@@ -45,7 +45,8 @@ void OpenTelemetryPlugin::setup(Controller *ctrl, PluginManager *pluginManager) 
         return;
 
     mutex = xSemaphoreCreateMutex();
-    spanQueue = xQueueCreate(4, sizeof(otel::SpanData *));
+    // Sized for a parent shot span plus one child span per phase.
+    spanQueue = xQueueCreate(16, sizeof(otel::SpanData *));
     buffer = static_cast<uint8_t *>(heap_caps_malloc(BUFFER_SIZE, MALLOC_CAP_SPIRAM));
     if (buffer == nullptr)
         buffer = static_cast<uint8_t *>(malloc(BUFFER_SIZE));
@@ -74,6 +75,8 @@ void OpenTelemetryPlugin::setup(Controller *ctrl, PluginManager *pluginManager) 
         snapshot.pressure = v;
         if (shotActive && v > peakPressure)
             peakPressure = v;
+        if (activePhase >= 0 && v > phases[activePhase].peakPressure)
+            phases[activePhase].peakPressure = v;
         unlock();
     });
     pluginManager->on("pump:flow:change", [this](Event &event) {
@@ -82,6 +85,8 @@ void OpenTelemetryPlugin::setup(Controller *ctrl, PluginManager *pluginManager) 
         snapshot.pumpFlow = v;
         if (shotActive && v > peakFlow)
             peakFlow = v;
+        if (activePhase >= 0 && v > phases[activePhase].peakFlow)
+            phases[activePhase].peakFlow = v;
         unlock();
     });
 
@@ -100,6 +105,7 @@ void OpenTelemetryPlugin::setup(Controller *ctrl, PluginManager *pluginManager) 
     if (tracesEnabled) {
         pluginManager->on("controller:brew:start", [this](Event &) { onBrewStart(); });
         pluginManager->on("controller:brew:end", [this](Event &) { onBrewEnd(); });
+        pluginManager->on("controller:brew:phase", [this](Event &event) { onBrewPhase(event.getInt("index")); });
     }
 
     // Pin to core 1 so the blocking TLS handshakes stay off core 0 (WiFi MAC,
@@ -124,6 +130,8 @@ void OpenTelemetryPlugin::onBrewStart() {
     peakPressure = 0.0f;
     peakFlow = 0.0f;
     maxWeight = 0.0f;
+    phases.clear();
+    activePhase = -1;
     Profile &profile = controller->getProfileManager()->getSelectedProfile();
     shotProfileLabel = profile.label;
     shotProfileType = profile.type;
@@ -132,13 +140,40 @@ void OpenTelemetryPlugin::onBrewStart() {
     unlock();
 }
 
+void OpenTelemetryPlugin::onBrewPhase(int index) {
+    const uint64_t now = nowUnixNanos();
+    lock();
+    if (!shotActive) {
+        unlock();
+        return;
+    }
+    String name;
+    String type;
+    Process *process = controller->getProcess();
+    if (process != nullptr && process->getType() == MODE_BREW) {
+        const Phase &phase = static_cast<BrewProcess *>(process)->currentPhase;
+        name = phase.name;
+        type = phase.phase == PhaseType::PHASE_TYPE_PREINFUSION ? "preinfusion" : "brew";
+    }
+    PhaseSpan ps;
+    ps.name = name.isEmpty() ? String("phase") : name;
+    ps.type = type;
+    ps.index = index;
+    ps.startNanos = now;
+    phases.push_back(ps);
+    activePhase = static_cast<int>(phases.size()) - 1;
+    unlock();
+}
+
 void OpenTelemetryPlugin::onBrewEnd() {
+    const uint64_t endNanos = nowUnixNanos();
     lock();
     if (!shotActive) {
         unlock();
         return;
     }
     shotActive = false;
+    activePhase = -1;
     const uint64_t startNanos = shotStartNanos;
     const unsigned long durationMs = millis() - shotStartMillis;
     const float pp = peakPressure;
@@ -152,6 +187,8 @@ void OpenTelemetryPlugin::onBrewEnd() {
     uint8_t sid[8];
     memcpy(tid, traceId, sizeof(tid));
     memcpy(sid, spanId, sizeof(sid));
+    std::vector<PhaseSpan> phaseCopy = phases;
+    phases.clear();
     unlock();
 
     if (!clockValid() || startNanos == 0)
@@ -164,7 +201,7 @@ void OpenTelemetryPlugin::onBrewEnd() {
     memcpy(span->spanId, sid, sizeof(sid));
     span->name = "shot";
     span->startNanos = startNanos;
-    span->endNanos = nowUnixNanos();
+    span->endNanos = endNanos;
     span->statusCode = 1; // OK
     span->attributes.push_back(otel::Attribute::str("coffee.profile.name", label));
     span->attributes.push_back(otel::Attribute::str("coffee.profile.type", type));
@@ -175,8 +212,43 @@ void OpenTelemetryPlugin::onBrewEnd() {
     span->attributes.push_back(otel::Attribute::boolean("coffee.shot.volumetric", vol));
     span->attributes.push_back(otel::Attribute::dbl("coffee.shot.target_temperature_c", tt));
 
-    if (xQueueSend(spanQueue, &span, 0) != pdTRUE)
+    if (xQueueSend(spanQueue, &span, 0) != pdTRUE) {
         delete span; // queue full; drop rather than block the brew thread
+        return;
+    }
+
+    // Child span per phase. A phase ends where the next one starts; the last
+    // phase ends with the shot. Same trace_id, parent = the shot span.
+    for (size_t i = 0; i < phaseCopy.size(); i++) {
+        const PhaseSpan &ph = phaseCopy[i];
+        const uint64_t phaseEnd = (i + 1 < phaseCopy.size()) ? phaseCopy[i + 1].startNanos : endNanos;
+        if (phaseEnd < ph.startNanos)
+            continue;
+
+        auto *child = new (std::nothrow) otel::SpanData();
+        if (child == nullptr)
+            return;
+        memcpy(child->traceId, tid, sizeof(tid));
+        esp_fill_random(child->spanId, sizeof(child->spanId));
+        memcpy(child->parentSpanId, sid, sizeof(sid));
+        child->hasParent = true;
+        child->name = ph.name;
+        child->startNanos = ph.startNanos;
+        child->endNanos = phaseEnd;
+        child->statusCode = 1; // OK
+        child->attributes.push_back(otel::Attribute::integer("coffee.phase.index", static_cast<int64_t>(ph.index)));
+        if (!ph.type.isEmpty())
+            child->attributes.push_back(otel::Attribute::str("coffee.phase.type", ph.type));
+        child->attributes.push_back(otel::Attribute::dbl("coffee.phase.peak_pressure_bar", ph.peakPressure));
+        child->attributes.push_back(otel::Attribute::dbl("coffee.phase.peak_flow_mls", ph.peakFlow));
+        child->attributes.push_back(otel::Attribute::integer(
+            "coffee.phase.duration_ms", static_cast<int64_t>((phaseEnd - ph.startNanos) / 1000000ULL)));
+
+        if (xQueueSend(spanQueue, &child, 0) != pdTRUE) {
+            delete child; // queue full; drop the rest
+            return;
+        }
+    }
 }
 
 void OpenTelemetryPlugin::exportTaskFn(void *arg) { static_cast<OpenTelemetryPlugin *>(arg)->exportLoop(); }
@@ -217,8 +289,14 @@ std::vector<otel::Attribute> OpenTelemetryPlugin::buildResourceAttributes() cons
 }
 
 void OpenTelemetryPlugin::exportMetrics() {
-    if (!clockValid() || WiFi.status() != WL_CONNECTED)
+    if (WiFi.status() != WL_CONNECTED) {
+        ESP_LOGW(OTEL_TAG, "metrics skipped: WiFi not connected");
         return;
+    }
+    if (!clockValid()) {
+        ESP_LOGW(OTEL_TAG, "metrics skipped: clock not NTP-synced yet");
+        return;
+    }
 
     Snapshot s;
     lock();
@@ -247,8 +325,10 @@ void OpenTelemetryPlugin::exportMetrics() {
 }
 
 void OpenTelemetryPlugin::exportSpan(otel::SpanData *span) {
-    if (WiFi.status() != WL_CONNECTED)
+    if (WiFi.status() != WL_CONNECTED) {
+        ESP_LOGW(OTEL_TAG, "span skipped: WiFi not connected");
         return;
+    }
     const String version = controller->getSystemInfo().version;
     const size_t len =
         otel::OtlpEncoder::encodeTrace(buildResourceAttributes(), SCOPE_NAME, version, *span, buffer, BUFFER_SIZE);
@@ -286,9 +366,11 @@ bool OpenTelemetryPlugin::sendPost(HTTPClient &http, const uint8_t *body, size_t
 
     const int code = http.POST(const_cast<uint8_t *>(body), len);
     if (code < 200 || code >= 300) {
-        ESP_LOGW(OTEL_TAG, "OTLP POST failed: %d", code);
+        const String resp = http.getString();
+        ESP_LOGW(OTEL_TAG, "OTLP POST failed: HTTP %d, body: %s", code, resp.c_str());
         return false;
     }
+    ESP_LOGI(OTEL_TAG, "OTLP POST ok: HTTP %d", code);
     return true;
 }
 
@@ -297,9 +379,12 @@ bool OpenTelemetryPlugin::postOtlp(const char *signalPath, const uint8_t *body, 
     base.trim();
     while (base.endsWith("/"))
         base.remove(base.length() - 1);
-    if (base.isEmpty())
+    if (base.isEmpty()) {
+        ESP_LOGW(OTEL_TAG, "OTLP skipped: endpoint not configured");
         return false;
+    }
     const String url = base + signalPath;
+    ESP_LOGI(OTEL_TAG, "OTLP POST -> %s (%u bytes)", url.c_str(), static_cast<unsigned>(len));
 
     HTTPClient http;
     http.setReuse(false);
@@ -313,12 +398,16 @@ bool OpenTelemetryPlugin::postOtlp(const char *signalPath, const uint8_t *body, 
         if (http.begin(client, url)) {
             ok = sendPost(http, body, len);
             http.end();
+        } else {
+            ESP_LOGW(OTEL_TAG, "OTLP begin() failed for %s", url.c_str());
         }
     } else {
         WiFiClient client;
         if (http.begin(client, url)) {
             ok = sendPost(http, body, len);
             http.end();
+        } else {
+            ESP_LOGW(OTEL_TAG, "OTLP begin() failed for %s", url.c_str());
         }
     }
     return ok;

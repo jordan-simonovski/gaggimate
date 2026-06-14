@@ -68,6 +68,8 @@ struct SpanEventData {
 struct SpanData {
     uint8_t traceId[16]{};
     uint8_t spanId[8]{};
+    uint8_t parentSpanId[8]{};
+    bool hasParent = false; // root span when false (parent_span_id omitted)
     String name;
     uint64_t startNanos = 0;
     uint64_t endNanos = 0;

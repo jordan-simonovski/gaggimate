@@ -120,6 +120,12 @@ size_t OtlpEncoder::encodeTrace(const std::vector<Attribute> &resourceAttrs, con
     memcpy(s.trace_id.bytes, span.traceId, sizeof(s.trace_id.bytes));
     s.span_id.size = sizeof(s.span_id.bytes);
     memcpy(s.span_id.bytes, span.spanId, sizeof(s.span_id.bytes));
+    // Leave parent_span_id at size 0 (omitted) for root spans; nanopb skips
+    // zero-length proto3 bytes, which collectors read as "no parent".
+    if (span.hasParent) {
+        s.parent_span_id.size = sizeof(s.parent_span_id.bytes);
+        memcpy(s.parent_span_id.bytes, span.parentSpanId, sizeof(s.parent_span_id.bytes));
+    }
     strlcpy(s.name, span.name.c_str(), sizeof(s.name));
     s.kind = otlp_SpanKind_SPAN_KIND_INTERNAL;
     s.start_time_unix_nano = span.startNanos;
