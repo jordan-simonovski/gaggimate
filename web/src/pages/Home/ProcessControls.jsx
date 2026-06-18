@@ -19,6 +19,7 @@ import { faMinus } from '@fortawesome/free-solid-svg-icons/faMinus';
 import { Tooltip } from '../../components/Tooltip.jsx';
 import { MODES } from './utils.js';
 import { ModeTab } from './ModeTab.jsx';
+import { formatGrindLevel, formatBrewRatio } from '../../config/grinders.js';
 
 const status = computed(() => machine.value.status);
 
@@ -262,6 +263,22 @@ const ProcessControls = props => {
     });
   }, [apiService, grind]);
 
+  const raiseGrindLevel = useCallback(() => {
+    apiService.send({ tp: 'req:raise-grind-level' });
+  }, [apiService]);
+
+  const lowerGrindLevel = useCallback(() => {
+    apiService.send({ tp: 'req:lower-grind-level' });
+  }, [apiService]);
+
+  const raiseDose = useCallback(() => {
+    apiService.send({ tp: 'req:raise-dose' });
+  }, [apiService]);
+
+  const lowerDose = useCallback(() => {
+    apiService.send({ tp: 'req:lower-dose' });
+  }, [apiService]);
+
   const startFlush = useCallback(() => {
     setIsFlushing(true);
     apiService
@@ -444,6 +461,63 @@ const ProcessControls = props => {
       )}
 
       <div className='flex flex-col items-center gap-4 py-1'>
+        {mode === 1 && !active && !finished && (
+          <div className='flex flex-col items-center gap-3'>
+            <div className='flex flex-row items-start justify-center gap-6'>
+              <div className='flex flex-col items-center gap-2'>
+                <div className='text-base-content/60 text-xs font-light tracking-wider'>GRIND</div>
+                <div className='flex items-center space-x-2'>
+                  <Tooltip content='Decrease grind level'>
+                    <button
+                      onClick={lowerGrindLevel}
+                      className='btn btn-ghost btn-sm flex h-8 w-8 items-center justify-center rounded-full p-0'
+                    >
+                      <FontAwesomeIcon icon={faMinus} className='h-3 w-3' />
+                    </button>
+                  </Tooltip>
+                  <div className='text-base-content min-w-[80px] text-center text-lg font-bold tabular-nums'>
+                    {formatGrindLevel(status.value.grindLevel, status.value.grinderModel)}
+                  </div>
+                  <Tooltip content='Increase grind level'>
+                    <button
+                      onClick={raiseGrindLevel}
+                      className='btn btn-ghost btn-sm flex h-8 w-8 items-center justify-center rounded-full p-0'
+                    >
+                      <FontAwesomeIcon icon={faPlus} className='h-3 w-3' />
+                    </button>
+                  </Tooltip>
+                </div>
+              </div>
+              <div className='flex flex-col items-center gap-2'>
+                <div className='text-base-content/60 text-xs font-light tracking-wider'>DOSE</div>
+                <div className='flex items-center space-x-2'>
+                  <Tooltip content='Decrease dose'>
+                    <button
+                      onClick={lowerDose}
+                      className='btn btn-ghost btn-sm flex h-8 w-8 items-center justify-center rounded-full p-0'
+                    >
+                      <FontAwesomeIcon icon={faMinus} className='h-3 w-3' />
+                    </button>
+                  </Tooltip>
+                  <div className='text-base-content min-w-[80px] text-center text-lg font-bold tabular-nums'>
+                    {(status.value.doseWeight ?? 0).toFixed(1)}g
+                  </div>
+                  <Tooltip content='Increase dose'>
+                    <button
+                      onClick={raiseDose}
+                      className='btn btn-ghost btn-sm flex h-8 w-8 items-center justify-center rounded-full p-0'
+                    >
+                      <FontAwesomeIcon icon={faPlus} className='h-3 w-3' />
+                    </button>
+                  </Tooltip>
+                </div>
+              </div>
+            </div>
+            <div className='text-base-content/60 text-sm tabular-nums'>
+              Brew ratio {formatBrewRatio(status.value.targetWeight, status.value.doseWeight) ?? '—'}
+            </div>
+          </div>
+        )}
         {grind &&
           showGrindTab &&
           !active &&

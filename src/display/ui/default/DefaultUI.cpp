@@ -2,6 +2,7 @@
 
 #include <WiFi.h>
 #include <display/core/Controller.h>
+#include <display/core/Grinders.h>
 #include <display/core/process/BrewProcess.h>
 #include <display/core/process/Process.h>
 #include <display/core/zones.h>
@@ -118,6 +119,15 @@ void DefaultUI::init() {
     });
     pluginManager->on("controller:grindVolume:change", [=](Event const &event) {
         grindVolume = event.getFloat("value");
+        rerender = true;
+    });
+    pluginManager->on("controller:grindLevel:change", [=](Event const &event) {
+        grindLevel = event.getFloat("value");
+        grinderModel = controller->getGrinderModel();
+        rerender = true;
+    });
+    pluginManager->on("controller:doseWeight:change", [=](Event const &event) {
+        doseWeight = event.getFloat("value");
         rerender = true;
     });
     pluginManager->on("controller:process:end", triggerRender);
@@ -379,6 +389,9 @@ void DefaultUI::setupState() {
     targetVolume = profileManager->getSelectedProfile().getTotalVolume();
     grindDuration = settings.getTargetGrindDuration();
     grindVolume = settings.getTargetGrindVolume();
+    grindLevel = static_cast<float>(settings.getGrindLevel());
+    grinderModel = settings.getGrinderModel();
+    doseWeight = static_cast<float>(settings.getDoseWeight());
     pressureAvailable = controller->getSystemInfo().capabilities.pressure ? 1 : 0;
     pressureScaling = std::ceil(settings.getPressureScaling());
     selectedProfileId = settings.getSelectedProfile();
@@ -555,6 +568,29 @@ void DefaultUI::setupReactive() {
                               }
                           },
                           &targetDuration, &targetVolume, &brewVolumetric);
+    effect_mgr.use_effect([=] { return currentScreen == ui_BrewScreen; },
+                          [=]() {
+                              const GrinderDef &g = getGrinderDef(grinderModel);
+                              char grindText[16];
+                              if (g.step < 1.0) {
+                                  snprintf(grindText, sizeof(grindText), "%.1f", grindLevel);
+                              } else {
+                                  snprintf(grindText, sizeof(grindText), "%d", static_cast<int>(grindLevel));
+                              }
+                              lv_label_set_text(ui_BrewScreen_grindLevel, grindText);
+                              lv_label_set_text_fmt(ui_BrewScreen_doseValue, "%.1fg", doseWeight);
+
+                              char ratioText[24];
+                              if (targetVolume > 0.0f && doseWeight > 0.0f) {
+                                  snprintf(ratioText, sizeof(ratioText), "Ratio  1:%.1f", targetVolume / doseWeight);
+                              } else {
+                                  snprintf(ratioText, sizeof(ratioText), "Ratio  -");
+                              }
+                              lv_label_set_text(ui_BrewScreen_ratioValue, ratioText);
+
+                              lv_label_set_text_fmt(ui_BrewScreen_grindSummary, "Grind %s  -  %.1fg", grindText, doseWeight);
+                          },
+                          &grindLevel, &grinderModel, &doseWeight, &targetVolume);
     effect_mgr.use_effect([=] { return currentScreen == ui_GrindScreen; },
                           [=]() {
                               if (volumetricMode) {
@@ -679,7 +715,9 @@ void DefaultUI::setupReactive() {
         [=] { return currentScreen == ui_BrewScreen; },
         [=]() {
             _ui_flag_modify(ui_BrewScreen_adjustments, LV_OBJ_FLAG_HIDDEN, brewScreenState == BrewScreenState::Settings);
-            _ui_flag_modify(ui_BrewScreen_acceptButton, LV_OBJ_FLAG_HIDDEN, brewScreenState == BrewScreenState::Settings);
+            _ui_flag_modify(ui_BrewScreen_grindDoseAdjust, LV_OBJ_FLAG_HIDDEN,
+                            brewScreenState == BrewScreenState::GrindDose);
+            _ui_flag_modify(ui_BrewScreen_acceptButton, LV_OBJ_FLAG_HIDDEN, brewScreenState != BrewScreenState::Brew);
             _ui_flag_modify(ui_BrewScreen_saveButton, LV_OBJ_FLAG_HIDDEN, brewScreenState == BrewScreenState::Settings);
             _ui_flag_modify(ui_BrewScreen_saveAsNewButton, LV_OBJ_FLAG_HIDDEN, brewScreenState == BrewScreenState::Settings);
             _ui_flag_modify(ui_BrewScreen_startButton, LV_OBJ_FLAG_HIDDEN, brewScreenState == BrewScreenState::Brew);

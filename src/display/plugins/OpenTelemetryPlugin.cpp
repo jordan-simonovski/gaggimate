@@ -1,6 +1,7 @@
 #include "OpenTelemetryPlugin.h"
 
 #include "../core/Controller.h"
+#include "../core/Grinders.h"
 #include "../core/process/BrewProcess.h"
 
 #include <HTTPClient.h>
@@ -9,6 +10,7 @@
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_random.h>
+#include <cmath>
 #include <ctime>
 #include <new>
 #include <sys/time.h>
@@ -29,6 +31,20 @@ static uint64_t nowUnixNanos() {
 // SNTP has set the wall clock (post 2020-09). Until then unix-nanos timestamps
 // would be garbage, so we hold off exporting.
 static bool clockValid() { return time(nullptr) > 1600000000L; }
+
+// Lowercase hex of a trace id, matching the value collectors store for the
+// span's trace_id. Used as the coffee.shot.id metric attribute so live samples
+// can be filtered/joined to the shot trace.
+static String traceIdHex(const uint8_t *id, size_t len) {
+    static const char digits[] = "0123456789abcdef";
+    String out;
+    out.reserve(len * 2);
+    for (size_t i = 0; i < len; i++) {
+        out += digits[id[i] >> 4];
+        out += digits[id[i] & 0x0F];
+    }
+    return out;
+}
 
 void OpenTelemetryPlugin::setup(Controller *ctrl, PluginManager *pluginManager) {
     controller = ctrl;
@@ -64,29 +80,102 @@ void OpenTelemetryPlugin::setup(Controller *ctrl, PluginManager *pluginManager) 
         };
     };
 
-    pluginManager->on("boiler:currentTemperature:change", floatField(&Snapshot::temp));
     pluginManager->on("boiler:targetTemperature:change", floatField(&Snapshot::targetTemp));
-    pluginManager->on("pump:puck-flow:change", floatField(&Snapshot::puckFlow));
-    pluginManager->on("pump:puck-resistance:change", floatField(&Snapshot::puckResistance));
+
+    pluginManager->on("boiler:currentTemperature:change", [this](Event &event) {
+        const float v = event.getFloat("value");
+        lock();
+        snapshot.temp = v;
+        if (shotActive) {
+            if (tempCount == 0) {
+                tempMin = v;
+                tempMax = v;
+            } else if (v < tempMin) {
+                tempMin = v;
+            } else if (v > tempMax) {
+                tempMax = v;
+            }
+            tempSum += v;
+            tempCount++;
+        }
+        unlock();
+    });
+    pluginManager->on("pump:puck-flow:change", [this](Event &event) {
+        const float v = event.getFloat("value");
+        lock();
+        snapshot.puckFlow = v;
+        if (shotActive && firstFlowMillis == 0 && v >= FIRST_FLOW_THRESHOLD_MLS)
+            firstFlowMillis = millis() - shotStartMillis;
+        unlock();
+    });
+    pluginManager->on("pump:puck-resistance:change", [this](Event &event) {
+        const float v = event.getFloat("value");
+        const bool valid = std::isfinite(v) && v > 0.0f && v < RESISTANCE_SANE_MAX;
+        lock();
+        snapshot.puckResistanceValid = valid;
+        if (valid) {
+            snapshot.puckResistance = v;
+            if (shotActive) {
+                resistanceSum += v;
+                resistanceSumSq += static_cast<double>(v) * v;
+                resistanceCount++;
+            }
+        }
+        unlock();
+    });
 
     pluginManager->on("boiler:pressure:change", [this](Event &event) {
         const float v = event.getFloat("value");
+        const float target = controller->getTargetPressure();
         lock();
         snapshot.pressure = v;
-        if (shotActive && v > peakPressure)
-            peakPressure = v;
-        if (activePhase >= 0 && v > phases[activePhase].peakPressure)
-            phases[activePhase].peakPressure = v;
+        if (shotActive) {
+            if (v > peakPressure)
+                peakPressure = v;
+            pressureSum += v;
+            pressureCount++;
+            if (target > 0.0f) { // only score adherence in pressure-targeted phases
+                pressureErrSum += fabsf(v - target);
+                pressureErrCount++;
+            }
+        }
+        if (activePhase >= 0) {
+            if (v > phases[activePhase].peakPressure)
+                phases[activePhase].peakPressure = v;
+            phases[activePhase].pressureSum += v;
+            phases[activePhase].pressureCount++;
+        }
         unlock();
     });
     pluginManager->on("pump:flow:change", [this](Event &event) {
         const float v = event.getFloat("value");
+        const float target = controller->getTargetFlow();
+        const unsigned long nowMs = millis();
         lock();
         snapshot.pumpFlow = v;
-        if (shotActive && v > peakFlow)
-            peakFlow = v;
-        if (activePhase >= 0 && v > phases[activePhase].peakFlow)
-            phases[activePhase].peakFlow = v;
+        // Integrate pump flow (ml/s) into total water dispensed (incl. flush).
+        if (lastFlowMillis != 0 && v > 0.0f) {
+            const double dtS = static_cast<double>(nowMs - lastFlowMillis) / 1000.0;
+            if (dtS > 0.0 && dtS < 5.0) // ignore stale gaps (sleep/idle)
+                waterTotalMl += static_cast<double>(v) * dtS;
+        }
+        lastFlowMillis = nowMs;
+        if (shotActive) {
+            if (v > peakFlow)
+                peakFlow = v;
+            flowSum += v;
+            flowCount++;
+            if (target > 0.0f) { // only score adherence in flow-targeted phases
+                flowErrSum += fabsf(v - target);
+                flowErrCount++;
+            }
+        }
+        if (activePhase >= 0) {
+            if (v > phases[activePhase].peakFlow)
+                phases[activePhase].peakFlow = v;
+            phases[activePhase].flowSum += v;
+            phases[activePhase].flowCount++;
+        }
         unlock();
     });
 
@@ -102,15 +191,49 @@ void OpenTelemetryPlugin::setup(Controller *ctrl, PluginManager *pluginManager) 
     pluginManager->on("controller:volumetric-measurement:bluetooth:change", weightHandler);
     pluginManager->on("controller:volumetric-measurement:estimation:change", weightHandler);
 
+    // Scale gone: clear the latched weight so the coffee.scale.weight gauge
+    // stops exporting the last reading (often a negative tare offset). Without
+    // this haveWeight stays true forever and the series flatlines at the stale
+    // value instead of going absent.
+    pluginManager->on("scale:disconnect", [this](Event &) {
+        lock();
+        snapshot.weight = 0.0f;
+        snapshot.haveWeight = false;
+        unlock();
+    });
+
     if (tracesEnabled) {
         pluginManager->on("controller:brew:start", [this](Event &) { onBrewStart(); });
         pluginManager->on("controller:brew:end", [this](Event &) { onBrewEnd(); });
         pluginManager->on("controller:brew:phase", [this](Event &event) { onBrewPhase(event.getInt("index")); });
     }
 
+    if (metricsEnabled) {
+        pluginManager->on("controller:wifi:disconnect", [this](Event &) {
+            lock();
+            wifiDisconnectsTotal++;
+            unlock();
+        });
+        pluginManager->on("controller:bluetooth:disconnect", [this](Event &) {
+            lock();
+            bleDisconnectsTotal++;
+            unlock();
+        });
+    }
+
+    // Cache identity on the main thread now and whenever the controller link
+    // (re)connects, so the export task never reads SystemInfo Strings directly.
+    pluginManager->on("controller:ready", [this](Event &) { refreshMetadata(); });
+    // Grinder model lives in Settings; refresh the cached resource attrs when the
+    // user changes it from the web UI so coffee.grinder.model stays current.
+    pluginManager->on("settings:changed", [this](Event &) { refreshMetadata(); });
+    refreshMetadata();
+
     // Pin to core 1 so the blocking TLS handshakes stay off core 0 (WiFi MAC,
-    // LWIP, AsyncTCP). 12KB stack covers mbedTLS.
-    xTaskCreatePinnedToCore(exportTaskFn, "OtelExport", 12288, this, 1, &taskHandle, 1);
+    // LWIP, AsyncTCP). 16KB stack: mbedTLS handshake + cert-bundle verification
+    // can spike well past 12KB; the extra 4KB is cheap insurance against an
+    // overflow that would reset the board mid-shot.
+    xTaskCreatePinnedToCore(exportTaskFn, "OtelExport", 16384, this, 1, &taskHandle, 1);
     ESP_LOGI(OTEL_TAG, "OpenTelemetry exporter started (metrics=%d traces=%d endpoint=%s)", metricsEnabled, tracesEnabled,
              endpoint.c_str());
 }
@@ -130,6 +253,12 @@ void OpenTelemetryPlugin::onBrewStart() {
     peakPressure = 0.0f;
     peakFlow = 0.0f;
     maxWeight = 0.0f;
+    pressureSum = flowSum = tempSum = resistanceSum = resistanceSumSq = 0.0;
+    pressureErrSum = flowErrSum = 0.0;
+    pressureCount = flowCount = tempCount = resistanceCount = 0;
+    pressureErrCount = flowErrCount = 0;
+    tempMin = tempMax = 0.0f;
+    firstFlowMillis = 0;
     phases.clear();
     activePhase = -1;
     Profile &profile = controller->getProfileManager()->getSelectedProfile();
@@ -137,6 +266,8 @@ void OpenTelemetryPlugin::onBrewStart() {
     shotProfileType = profile.type;
     shotVolumetric = profile.isVolumetric();
     shotTargetTemp = controller->getTargetTemp();
+    shotGrindLevel = static_cast<float>(controller->getGrindLevel());
+    shotDoseWeight = static_cast<float>(controller->getDoseWeight());
     unlock();
 }
 
@@ -176,17 +307,30 @@ void OpenTelemetryPlugin::onBrewEnd() {
     activePhase = -1;
     const uint64_t startNanos = shotStartNanos;
     const unsigned long durationMs = millis() - shotStartMillis;
+    shotsTotal++;
+    brewSecondsTotal += static_cast<double>(durationMs) / 1000.0;
     const float pp = peakPressure;
     const float pf = peakFlow;
     const float mw = maxWeight;
     const float tt = shotTargetTemp;
+    const float gl = shotGrindLevel;
+    const float dose = shotDoseWeight;
     const bool vol = shotVolumetric;
     const String label = shotProfileLabel;
     const String type = shotProfileType;
+    const double pSumL = pressureSum, pErrL = pressureErrSum, fSumL = flowSum, fErrL = flowErrSum;
+    const uint32_t pCntL = pressureCount, pErrCntL = pressureErrCount, fCntL = flowCount, fErrCntL = flowErrCount;
+    const double tSumL = tempSum, rSumL = resistanceSum, rSumSqL = resistanceSumSq;
+    const uint32_t tCntL = tempCount, rCntL = resistanceCount;
+    const float tMinL = tempMin, tMaxL = tempMax;
+    const unsigned long ttfL = firstFlowMillis;
     uint8_t tid[16];
     uint8_t sid[8];
     memcpy(tid, traceId, sizeof(tid));
     memcpy(sid, spanId, sizeof(sid));
+    memcpy(lastShotTraceId, traceId, sizeof(lastShotTraceId));
+    memcpy(lastShotSpanId, spanId, sizeof(lastShotSpanId));
+    haveLastShot = true;
     std::vector<PhaseSpan> phaseCopy = phases;
     phases.clear();
     unlock();
@@ -211,6 +355,37 @@ void OpenTelemetryPlugin::onBrewEnd() {
     span->attributes.push_back(otel::Attribute::dbl("coffee.shot.final_weight_g", mw));
     span->attributes.push_back(otel::Attribute::boolean("coffee.shot.volumetric", vol));
     span->attributes.push_back(otel::Attribute::dbl("coffee.shot.target_temperature_c", tt));
+    span->attributes.push_back(otel::Attribute::dbl("coffee.grind.level", gl));
+    if (dose > 0.0f) {
+        span->attributes.push_back(otel::Attribute::dbl("coffee.dose.weight_g", dose));
+        if (mw > 0.0f) // brew ratio = yield / dose (e.g. 2.0 == 1:2)
+            span->attributes.push_back(otel::Attribute::dbl("coffee.brew.ratio", mw / dose));
+    }
+    if (ttfL > 0)
+        span->attributes.push_back(
+            otel::Attribute::integer("coffee.shot.time_to_first_flow_ms", static_cast<int64_t>(ttfL)));
+    if (pCntL > 0)
+        span->attributes.push_back(otel::Attribute::dbl("coffee.pressure.avg_bar", pSumL / pCntL));
+    if (fCntL > 0)
+        span->attributes.push_back(otel::Attribute::dbl("coffee.flow.avg_mls", fSumL / fCntL));
+    if (pErrCntL > 0)
+        span->attributes.push_back(otel::Attribute::dbl("coffee.pressure.adherence_bar", pErrL / pErrCntL));
+    if (fErrCntL > 0)
+        span->attributes.push_back(otel::Attribute::dbl("coffee.flow.adherence_mls", fErrL / fErrCntL));
+    if (tCntL > 0) {
+        span->attributes.push_back(otel::Attribute::dbl("coffee.temp.avg_c", tSumL / tCntL));
+        span->attributes.push_back(otel::Attribute::dbl("coffee.temp.stability_c", tMaxL - tMinL));
+    }
+    if (rCntL > 0) {
+        const double rAvg = rSumL / rCntL;
+        span->attributes.push_back(otel::Attribute::dbl("coffee.puck.avg_resistance", rAvg));
+        if (rCntL > 1 && rAvg > 0.0) {
+            double var = rSumSqL / rCntL - rAvg * rAvg;
+            if (var < 0.0)
+                var = 0.0;
+            span->attributes.push_back(otel::Attribute::dbl("coffee.puck.resistance_cv", std::sqrt(var) / rAvg));
+        }
+    }
 
     if (xQueueSend(spanQueue, &span, 0) != pdTRUE) {
         delete span; // queue full; drop rather than block the brew thread
@@ -241,6 +416,10 @@ void OpenTelemetryPlugin::onBrewEnd() {
             child->attributes.push_back(otel::Attribute::str("coffee.phase.type", ph.type));
         child->attributes.push_back(otel::Attribute::dbl("coffee.phase.peak_pressure_bar", ph.peakPressure));
         child->attributes.push_back(otel::Attribute::dbl("coffee.phase.peak_flow_mls", ph.peakFlow));
+        if (ph.pressureCount > 0)
+            child->attributes.push_back(otel::Attribute::dbl("coffee.phase.avg_pressure_bar", ph.pressureSum / ph.pressureCount));
+        if (ph.flowCount > 0)
+            child->attributes.push_back(otel::Attribute::dbl("coffee.phase.avg_flow_mls", ph.flowSum / ph.flowCount));
         child->attributes.push_back(otel::Attribute::integer(
             "coffee.phase.duration_ms", static_cast<int64_t>((phaseEnd - ph.startNanos) / 1000000ULL)));
 
@@ -285,7 +464,19 @@ std::vector<otel::Attribute> OpenTelemetryPlugin::buildResourceAttributes() cons
         attrs.push_back(otel::Attribute::str("service.version", info.version));
     if (info.hardware.length() > 0)
         attrs.push_back(otel::Attribute::str("host.type", info.hardware));
+    attrs.push_back(otel::Attribute::str("coffee.grinder.model", getGrinderDef(controller->getGrinderModel()).name));
     return attrs;
+}
+
+void OpenTelemetryPlugin::refreshMetadata() {
+    // Must run on the main thread: buildResourceAttributes() and getSystemInfo()
+    // read controller-owned Strings.
+    std::vector<otel::Attribute> attrs = buildResourceAttributes();
+    const String version = controller->getSystemInfo().version;
+    lock();
+    resourceAttrs = attrs;
+    scopeVersion = version;
+    unlock();
 }
 
 void OpenTelemetryPlugin::exportMetrics() {
@@ -298,25 +489,87 @@ void OpenTelemetryPlugin::exportMetrics() {
         return;
     }
 
+    const uint64_t now = nowUnixNanos();
     Snapshot s;
+    uint64_t shots, wifiDc, bleDc, startNanos;
+    double brewSecs, waterMl;
+    bool inShot, haveLast;
+    uint8_t curTid[16], curSid[8], lastTid[16], lastSid[8];
+    std::vector<otel::Attribute> resAttrs;
+    String version;
+    String phaseName;
+    float shotGl = 0.0f;
     lock();
     s = snapshot;
+    if (metricsStartNanos == 0)
+        metricsStartNanos = now;
+    startNanos = metricsStartNanos;
+    shots = shotsTotal;
+    brewSecs = brewSecondsTotal;
+    waterMl = waterTotalMl;
+    wifiDc = wifiDisconnectsTotal;
+    bleDc = bleDisconnectsTotal;
+    inShot = shotActive;
+    shotGl = shotGrindLevel;
+    if (shotActive && activePhase >= 0 && activePhase < static_cast<int>(phases.size()))
+        phaseName = phases[activePhase].name;
+    memcpy(curTid, traceId, sizeof(curTid));
+    memcpy(curSid, spanId, sizeof(curSid));
+    haveLast = haveLastShot;
+    memcpy(lastTid, lastShotTraceId, sizeof(lastTid));
+    memcpy(lastSid, lastShotSpanId, sizeof(lastSid));
+    resAttrs = resourceAttrs;
+    version = scopeVersion;
     unlock();
 
-    std::vector<otel::MetricPoint> metrics;
+    auto setExemplar = [](otel::MetricPoint &m, const uint8_t *tid, const uint8_t *sid) {
+        m.hasExemplar = true;
+        memcpy(m.traceId, tid, sizeof(m.traceId));
+        memcpy(m.spanId, sid, sizeof(m.spanId));
+    };
+
+    using MP = otel::MetricPoint;
+    std::vector<MP> metrics;
     metrics.push_back({"coffee.boiler.temperature", "Cel", s.temp});
     metrics.push_back({"coffee.boiler.target_temperature", "Cel", s.targetTemp});
     metrics.push_back({"coffee.boiler.pressure", "bar", s.pressure});
     metrics.push_back({"coffee.pump.flow", "ml/s", s.pumpFlow});
     metrics.push_back({"coffee.pump.puck_flow", "ml/s", s.puckFlow});
-    metrics.push_back({"coffee.pump.puck_resistance", "", s.puckResistance});
+    if (s.puckResistanceValid)
+        metrics.push_back({"coffee.pump.puck_resistance", "", s.puckResistance});
     if (s.haveWeight)
         metrics.push_back({"coffee.scale.weight", "g", s.weight});
+    const size_t gaugeCount = metrics.size();
+    // Cumulative monotonic counters (Sums).
+    metrics.push_back({"coffee.shots.total", "{shot}", static_cast<double>(shots), MP::SUM, true});
+    const size_t idxShots = metrics.size() - 1;
+    metrics.push_back({"coffee.brew.duration.total", "s", brewSecs, MP::SUM, true});
+    const size_t idxBrew = metrics.size() - 1;
+    metrics.push_back({"coffee.water.total", "ml", waterMl, MP::SUM, true});
+    metrics.push_back({"coffee.wifi.disconnects.total", "{event}", static_cast<double>(wifiDc), MP::SUM, true});
+    metrics.push_back({"coffee.bluetooth.disconnects.total", "{event}", static_cast<double>(bleDc), MP::SUM, true});
 
-    const String version = controller->getSystemInfo().version;
-    const size_t len =
-        otel::OtlpEncoder::encodeMetrics(buildResourceAttributes(), SCOPE_NAME, version, metrics, nowUnixNanos(), buffer,
-                                         BUFFER_SIZE);
+    // While a shot is in flight, the live gauges belong to its trace and its
+    // current phase. Tag them with shot id + phase name (so samples can be
+    // grouped/filtered per shot/phase) and an exemplar to the shot span. The
+    // cumulative Sums stay attribute-free so their series remain mergeable.
+    if (inShot) {
+        const String shotId = traceIdHex(curTid, sizeof(curTid));
+        for (size_t i = 0; i < gaugeCount; i++) {
+            setExemplar(metrics[i], curTid, curSid);
+            metrics[i].attributes.push_back(otel::Attribute::str("coffee.shot.id", shotId));
+            metrics[i].attributes.push_back(otel::Attribute::dbl("coffee.grind.level", shotGl));
+            if (!phaseName.isEmpty())
+                metrics[i].attributes.push_back(otel::Attribute::str("coffee.phase.name", phaseName));
+        }
+    }
+    if (haveLast) {
+        setExemplar(metrics[idxShots], lastTid, lastSid);
+        setExemplar(metrics[idxBrew], lastTid, lastSid);
+    }
+
+    const size_t len = otel::OtlpEncoder::encodeMetrics(resAttrs, SCOPE_NAME, version, metrics, now, startNanos, buffer,
+                                                        BUFFER_SIZE);
     if (len == 0) {
         ESP_LOGW(OTEL_TAG, "Failed to encode metrics");
         return;
@@ -329,9 +582,11 @@ void OpenTelemetryPlugin::exportSpan(otel::SpanData *span) {
         ESP_LOGW(OTEL_TAG, "span skipped: WiFi not connected");
         return;
     }
-    const String version = controller->getSystemInfo().version;
-    const size_t len =
-        otel::OtlpEncoder::encodeTrace(buildResourceAttributes(), SCOPE_NAME, version, *span, buffer, BUFFER_SIZE);
+    lock();
+    std::vector<otel::Attribute> resAttrs = resourceAttrs;
+    String version = scopeVersion;
+    unlock();
+    const size_t len = otel::OtlpEncoder::encodeTrace(resAttrs, SCOPE_NAME, version, *span, buffer, BUFFER_SIZE);
     if (len == 0) {
         ESP_LOGW(OTEL_TAG, "Failed to encode span");
         return;

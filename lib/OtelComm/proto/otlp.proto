@@ -48,6 +48,16 @@ message Resource {
 // metrics.proto
 // ---------------------------------------------------------------------------
 
+// Links a data point to a representative trace (metrics -> traces correlation).
+// Trimmed to the fields we emit; filtered_attributes (7) and as_int (6) are
+// omitted but field numbers below match upstream OTLP exactly.
+message Exemplar {
+    fixed64 time_unix_nano = 2;
+    double as_double = 3;
+    bytes span_id = 4;
+    bytes trace_id = 5;
+}
+
 message NumberDataPoint {
     repeated KeyValue attributes = 7;
     fixed64 start_time_unix_nano = 2;
@@ -56,10 +66,23 @@ message NumberDataPoint {
         double as_double = 4;
         sfixed64 as_int = 6;
     }
+    repeated Exemplar exemplars = 5;
 }
 
 message Gauge {
     repeated NumberDataPoint data_points = 1;
+}
+
+enum AggregationTemporality {
+    AGGREGATION_TEMPORALITY_UNSPECIFIED = 0;
+    AGGREGATION_TEMPORALITY_DELTA = 1;
+    AGGREGATION_TEMPORALITY_CUMULATIVE = 2;
+}
+
+message Sum {
+    repeated NumberDataPoint data_points = 1;
+    AggregationTemporality aggregation_temporality = 2;
+    bool is_monotonic = 3;
 }
 
 message Metric {
@@ -68,6 +91,7 @@ message Metric {
     string unit = 3;
     oneof data {
         Gauge gauge = 5;
+        Sum sum = 7;
     }
 }
 

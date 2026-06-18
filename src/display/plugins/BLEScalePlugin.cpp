@@ -225,6 +225,13 @@ void BLEScalePlugin::disconnect() {
         lastBatteryLevel = REMOTE_SCALES_BATTERY_UNKNOWN;
         lastWeightUnit = ScaleWeightUnit::UNKNOWN;
         warnedOunceMidBrew = false;
+
+        // Signal the transition so consumers can drop the now-stale scale
+        // state (weight gauge, battery pill, ...) instead of latching the
+        // last reading. No payload: connection state is binary.
+        if (pluginManager != nullptr) {
+            pluginManager->trigger("scale:disconnect");
+        }
     }
 }
 

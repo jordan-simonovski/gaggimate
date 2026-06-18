@@ -140,6 +140,9 @@ void WebUIPlugin::loop() {
         statusDoc["gtv"] = controller->getSettings().getTargetGrindVolume();
         statusDoc["gt"] = controller->isVolumetricAvailable() && controller->getSettings().isVolumetricTarget() ? 1 : 0;
         statusDoc["gact"] = controller->isGrindActive() ? 1 : 0;
+        statusDoc["grm"] = controller->getGrinderModel();
+        statusDoc["gl"] = controller->getGrindLevel();
+        statusDoc["dw"] = controller->getDoseWeight();
         statusDoc["wl"] = controller->getWaterLevel();
         statusDoc["tof"] = controller->getTofDistance();
         statusDoc["rssi"] = 0;
@@ -389,6 +392,22 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                     controller->raiseGrindTarget();
                 } else if (msgType == "req:lower-grind-target") {
                     controller->lowerGrindTarget();
+                } else if (msgType == "req:raise-grind-level") {
+                    controller->raiseGrindLevel();
+                } else if (msgType == "req:lower-grind-level") {
+                    controller->lowerGrindLevel();
+                } else if (msgType == "req:change-grind-level") {
+                    if (doc["value"].is<float>()) {
+                        controller->setGrindLevel(doc["value"].as<float>());
+                    }
+                } else if (msgType == "req:raise-dose") {
+                    controller->raiseDoseWeight();
+                } else if (msgType == "req:lower-dose") {
+                    controller->lowerDoseWeight();
+                } else if (msgType == "req:change-dose") {
+                    if (doc["value"].is<float>()) {
+                        controller->setDoseWeight(doc["value"].as<float>());
+                    }
                 } else if (msgType == "req:change-mode") {
                     if (doc["mode"].is<uint8_t>()) {
                         auto mode = doc["mode"].as<uint8_t>();
@@ -592,6 +611,14 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 settings->setSmartGrindIp(request->arg("smartGrindIp"));
             if (request->hasArg("smartGrindMode"))
                 settings->setSmartGrindMode(request->arg("smartGrindMode").toInt());
+            // grinderModel must be applied before grindLevel so the level is
+            // clamped/snapped to the newly selected grinder's scale.
+            if (request->hasArg("grinderModel"))
+                settings->setGrinderModel(request->arg("grinderModel").toInt());
+            if (request->hasArg("grindLevel"))
+                settings->setGrindLevel(request->arg("grindLevel").toDouble());
+            if (request->hasArg("doseWeight"))
+                settings->setDoseWeight(request->arg("doseWeight").toDouble());
             settings->setHomeAssistant(request->hasArg("homeAssistant"));
             if (request->hasArg("haUser"))
                 settings->setHomeAssistantUser(request->arg("haUser"));
@@ -734,6 +761,9 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["smartGrindActive"] = settings.isSmartGrindActive();
     doc["smartGrindIp"] = settings.getSmartGrindIp();
     doc["smartGrindMode"] = settings.getSmartGrindMode();
+    doc["grinderModel"] = settings.getGrinderModel();
+    doc["grindLevel"] = settings.getGrindLevel();
+    doc["doseWeight"] = settings.getDoseWeight();
     doc["momentaryButtons"] = settings.isMomentaryButtons();
     doc["brewDelay"] = settings.getBrewDelay();
     doc["grindDelay"] = settings.getGrindDelay();

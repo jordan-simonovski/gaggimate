@@ -20,6 +20,7 @@ import { useContext, useState } from 'preact/hooks';
 import { useQuery } from 'preact-fetching';
 import PropTypes from 'prop-types';
 import { ApiServiceContext, machine } from '../../services/ApiService.js';
+import { formatGrindLevel, formatBrewRatio } from '../../config/grinders.js';
 import { ModeTab } from './ModeTab.jsx';
 import {
   fmtElapsed,
@@ -126,7 +127,7 @@ const InfoView = ({ title, hint }) => (
   </div>
 );
 
-const BrewIdleView = ({ s, brewTarget, sendTarget }) => (
+const BrewIdleView = ({ s, brewTarget, sendTarget, send }) => (
   <div className='flex w-full max-w-sm min-w-0 flex-col items-stretch gap-3'>
     <a
       href='/profiles'
@@ -145,6 +146,23 @@ const BrewIdleView = ({ s, brewTarget, sendTarget }) => (
         </span>
       </span>
     </a>
+    <div className='flex items-start justify-center gap-4'>
+      <Adjuster
+        label='GRIND'
+        value={formatGrindLevel(s.grindLevel, s.grinderModel)}
+        onDecrease={() => send('req:lower-grind-level')}
+        onIncrease={() => send('req:raise-grind-level')}
+      />
+      <Adjuster
+        label='DOSE'
+        value={`${(s.doseWeight ?? 0).toFixed(1)}g`}
+        onDecrease={() => send('req:lower-dose')}
+        onIncrease={() => send('req:raise-dose')}
+      />
+    </div>
+    <div className='text-base-content/60 self-center text-[0.65rem] tabular-nums'>
+      ratio {formatBrewRatio(s.targetWeight, s.doseWeight) ?? '—'}
+    </div>
     {s.volumetricAvailable && <TargetToggle value={brewTarget ? 1 : 0} onChange={sendTarget} />}
   </div>
 );
@@ -241,7 +259,8 @@ export default function CompactProcessControls({ brew, mode, changeMode }) {
     if (processRunning && finished) return <FinishedView elapsed={fmtElapsed(p?.e)} />;
     if (processRunning) return <ActiveView p={p} grind={grind} />;
     if (mode === 0) return <InfoView title='Standby' hint='Machine is ready' />;
-    if (mode === 1) return <BrewIdleView s={s} brewTarget={brewTarget} sendTarget={sendTarget} />;
+    if (mode === 1)
+      return <BrewIdleView s={s} brewTarget={brewTarget} sendTarget={sendTarget} send={send} />;
     if (mode === 2 || mode === 3) return <TemperatureView s={s} mode={mode} send={send} />;
     if (grind && !grindAvailable)
       return <InfoView title='Grind' hint='Grind function not available' />;

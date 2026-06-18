@@ -7,6 +7,7 @@
 #include <cmath>
 #include <ctime>
 #include <display/config.h>
+#include <display/core/Grinders.h>
 #include <display/core/constants.h>
 #include <display/core/process/BrewProcess.h>
 #include <display/core/process/GrindProcess.h>
@@ -673,6 +674,32 @@ void Controller::setTargetGrindVolume(double volume) {
     settings.setTargetGrindVolume(event.getFloat("value"));
     updateLastAction();
 }
+
+int Controller::getGrinderModel() const { return settings.getGrinderModel(); }
+
+double Controller::getGrindLevel() const { return settings.getGrindLevel(); }
+
+void Controller::setGrindLevel(double level) {
+    Event event = pluginManager->trigger("controller:grindLevel:change", "value", static_cast<float>(level));
+    settings.setGrindLevel(event.getFloat("value"));
+    updateLastAction();
+}
+
+void Controller::raiseGrindLevel() { setGrindLevel(settings.getGrindLevel() + getGrinderDef(settings.getGrinderModel()).step); }
+
+void Controller::lowerGrindLevel() { setGrindLevel(settings.getGrindLevel() - getGrinderDef(settings.getGrinderModel()).step); }
+
+double Controller::getDoseWeight() const { return settings.getDoseWeight(); }
+
+void Controller::setDoseWeight(double weight) {
+    Event event = pluginManager->trigger("controller:doseWeight:change", "value", static_cast<float>(weight));
+    settings.setDoseWeight(event.getFloat("value"));
+    updateLastAction();
+}
+
+void Controller::raiseDoseWeight() { setDoseWeight(settings.getDoseWeight() + 0.5); }
+
+void Controller::lowerDoseWeight() { setDoseWeight(settings.getDoseWeight() - 0.5); }
 
 void Controller::raiseTemp() {
     float temp = getTargetTemp();

@@ -52,7 +52,7 @@ pb_size_t fillAttributes(otlp_KeyValue *dst, pb_size_t cap, const std::vector<At
 
 size_t OtlpEncoder::encodeMetrics(const std::vector<Attribute> &resourceAttrs, const String &scopeName,
                                   const String &scopeVersion, const std::vector<MetricPoint> &metrics, uint64_t timeNanos,
-                                  uint8_t *buf, size_t bufSize) {
+                                  uint64_t startTimeNanos, uint8_t *buf, size_t bufSize) {
     auto *req = static_cast<otlp_ExportMetricsServiceRequest *>(otlpAlloc(sizeof(otlp_ExportMetricsServiceRequest)));
     if (req == nullptr)
         return 0;
@@ -79,13 +79,34 @@ size_t OtlpEncoder::encodeMetrics(const std::vector<Attribute> &resourceAttrs, c
         otlp_Metric &m = sm.metrics[j];
         strlcpy(m.name, metrics[j].name.c_str(), sizeof(m.name));
         strlcpy(m.unit, metrics[j].unit.c_str(), sizeof(m.unit));
-        m.which_data = otlp_Metric_gauge_tag;
-        m.data.gauge.data_points_count = 1;
-        otlp_NumberDataPoint &dp = m.data.gauge.data_points[0];
-        dp.attributes_count = 0;
-        dp.time_unix_nano = timeNanos;
-        dp.which_value = otlp_NumberDataPoint_as_double_tag;
-        dp.value.as_double = metrics[j].value;
+        otlp_NumberDataPoint *dp = nullptr;
+        if (metrics[j].kind == MetricPoint::SUM) {
+            m.which_data = otlp_Metric_sum_tag;
+            m.data.sum.aggregation_temporality = otlp_AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE;
+            m.data.sum.is_monotonic = metrics[j].monotonic;
+            m.data.sum.data_points_count = 1;
+            dp = &m.data.sum.data_points[0];
+            dp->start_time_unix_nano = startTimeNanos;
+        } else {
+            m.which_data = otlp_Metric_gauge_tag;
+            m.data.gauge.data_points_count = 1;
+            dp = &m.data.gauge.data_points[0];
+        }
+        dp->time_unix_nano = timeNanos;
+        dp->which_value = otlp_NumberDataPoint_as_double_tag;
+        dp->value.as_double = metrics[j].value;
+        dp->attributes_count =
+            fillAttributes(dp->attributes, sizeof(dp->attributes) / sizeof(dp->attributes[0]), metrics[j].attributes);
+        if (metrics[j].hasExemplar) {
+            dp->exemplars_count = 1;
+            otlp_Exemplar &ex = dp->exemplars[0];
+            ex.time_unix_nano = timeNanos;
+            ex.as_double = metrics[j].value;
+            ex.span_id.size = sizeof(ex.span_id.bytes);
+            memcpy(ex.span_id.bytes, metrics[j].spanId, sizeof(ex.span_id.bytes));
+            ex.trace_id.size = sizeof(ex.trace_id.bytes);
+            memcpy(ex.trace_id.bytes, metrics[j].traceId, sizeof(ex.trace_id.bytes));
+        }
     }
 
     pb_ostream_t os = pb_ostream_from_buffer(buf, bufSize);

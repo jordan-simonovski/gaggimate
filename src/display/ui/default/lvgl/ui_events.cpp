@@ -38,6 +38,16 @@ void onBrewTimeRaise(lv_event_t *e) {
     controller.raiseBrewTarget();
 }
 
+void onBrewGrindLevelLower(lv_event_t *e) { controller.lowerGrindLevel(); }
+
+void onBrewGrindLevelRaise(lv_event_t *e) { controller.raiseGrindLevel(); }
+
+void onBrewDoseLower(lv_event_t *e) { controller.lowerDoseWeight(); }
+
+void onBrewDoseRaise(lv_event_t *e) { controller.raiseDoseWeight(); }
+
+void onBrewGrindDoseOpen(lv_event_t *e) { controller.getUI()->changeBrewScreenMode(BrewScreenState::GrindDose); }
+
 void onSteamTempLower(lv_event_t *e) { controller.lowerTemp(); }
 
 void onSteamTempRaise(lv_event_t *e) { controller.raiseTemp(); }
@@ -132,6 +142,10 @@ void onBrewScreenLoad(lv_event_t *e) {
     lv_obj_set_ext_click_area(ui_BrewScreen_downDurationButton, 15);
     lv_obj_set_ext_click_area(ui_BrewScreen_upTempButton, 15);
     lv_obj_set_ext_click_area(ui_BrewScreen_downTempButton, 15);
+    lv_obj_set_ext_click_area(ui_BrewScreen_upGrindButton, 15);
+    lv_obj_set_ext_click_area(ui_BrewScreen_downGrindButton, 15);
+    lv_obj_set_ext_click_area(ui_BrewScreen_upDoseButton, 15);
+    lv_obj_set_ext_click_area(ui_BrewScreen_downDoseButton, 15);
 }
 
 void onSimpleProcessScreenLoad(lv_event_t *e) {

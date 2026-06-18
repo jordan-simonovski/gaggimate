@@ -52,11 +52,23 @@ struct Attribute {
     }
 };
 
-// One gauge metric (one data point) for the current export tick.
+// One metric (one data point) for the current export tick. GAUGE is an
+// instantaneous reading; SUM is a cumulative monotonic counter (e.g. shots
+// total) carrying a start time so backends can compute rates.
 struct MetricPoint {
+    enum Kind { GAUGE, SUM };
     String name;
     String unit;
     double value = 0.0;
+    Kind kind = GAUGE;
+    bool monotonic = false; // only meaningful for SUM
+    // Optional exemplar linking this point to a trace (metrics -> traces).
+    bool hasExemplar = false;
+    uint8_t traceId[16] = {};
+    uint8_t spanId[8] = {};
+    // Optional per-point attributes (e.g. coffee.shot.id, coffee.phase.name).
+    // Capped by otlp.NumberDataPoint.attributes in otlp.options.
+    std::vector<Attribute> attributes;
 };
 
 struct SpanEventData {
@@ -82,9 +94,11 @@ class OtlpEncoder {
   public:
     // Encode an ExportMetricsServiceRequest. Returns the encoded byte count, or
     // 0 on failure (buffer too small / out of memory).
+    // startTimeNanos is the cumulative-counter start (process/collector start);
+    // it is only written for SUM points. Gauges ignore it.
     static size_t encodeMetrics(const std::vector<Attribute> &resourceAttrs, const String &scopeName,
                                 const String &scopeVersion, const std::vector<MetricPoint> &metrics, uint64_t timeNanos,
-                                uint8_t *buf, size_t bufSize);
+                                uint64_t startTimeNanos, uint8_t *buf, size_t bufSize);
 
     // Encode an ExportTraceServiceRequest carrying a single span.
     static size_t encodeTrace(const std::vector<Attribute> &resourceAttrs, const String &scopeName,

@@ -1,7 +1,9 @@
 #include "Settings.h"
 
 #include <algorithm>
+#include <cmath>
 #include <utility>
+#include <display/core/Grinders.h>
 #include <display/util/ColorConversion.h>
 
 Settings::Settings() {
@@ -11,6 +13,9 @@ Settings::Settings() {
     targetWaterTemp = preferences.getInt("tw", 80);
     targetGrindVolume = preferences.getDouble("tgv", 18.0);
     targetGrindDuration = preferences.getInt("tgd", 25000);
+    grinderModel = preferences.getInt("gr_md", 0);
+    grindLevel = preferences.getDouble("gr_lv", getGrinderDef(grinderModel).min);
+    doseWeight = preferences.getDouble("ds_w", 18.0);
     brewDelay = preferences.getDouble("del_br", 800.0);
     grindDelay = preferences.getDouble("del_gd", 1000.0);
     delayAdjust = preferences.getBool("del_ad", true);
@@ -166,6 +171,27 @@ void Settings::setTargetGrindVolume(double target_grind_volume) {
 
 void Settings::setTargetGrindDuration(const int target_duration) {
     targetGrindDuration = target_duration;
+    save();
+}
+
+void Settings::setGrindLevel(double grind_level) {
+    const GrinderDef &g = getGrinderDef(grinderModel);
+    double v = std::clamp(grind_level, g.min, g.max);
+    if (g.step > 0.0) // snap to the grinder's step relative to its minimum
+        v = g.min + std::round((v - g.min) / g.step) * g.step;
+    grindLevel = std::clamp(v, g.min, g.max);
+    save();
+}
+
+void Settings::setGrinderModel(int grinder_model) {
+    if (grinder_model < 0 || grinder_model >= GRINDER_COUNT)
+        grinder_model = 0;
+    grinderModel = grinder_model;
+    setGrindLevel(grindLevel); // re-clamp/snap the level to the new grinder scale
+}
+
+void Settings::setDoseWeight(double dose_weight) {
+    doseWeight = std::clamp(dose_weight, 0.1, 60.0);
     save();
 }
 
@@ -517,6 +543,9 @@ void Settings::doSave() {
     preferences.putInt("tw", targetWaterTemp);
     preferences.putDouble("tgv", targetGrindVolume);
     preferences.putInt("tgd", targetGrindDuration);
+    preferences.putInt("gr_md", grinderModel);
+    preferences.putDouble("gr_lv", grindLevel);
+    preferences.putDouble("ds_w", doseWeight);
     preferences.putDouble("del_br", brewDelay);
     preferences.putDouble("del_gd", grindDelay);
     preferences.putBool("del_ad", delayAdjust);

@@ -19,14 +19,22 @@ otlp.InstrumentationScope.version max_size:24
 # Resource identity (service.name/instance.id/version, machine hardware, ...).
 otlp.Resource.attributes max_count:6
 
-# Metrics: one Gauge per Metric, one point per Gauge per export tick. Data
-# points carry no per-point attributes today (identity is the metric name).
-otlp.NumberDataPoint.attributes max_count:1
+# Metrics: one Gauge/Sum per Metric, one point per export tick. Live gauges
+# carry up to three per-point attributes while a shot is in flight
+# (coffee.shot.id + coffee.grind.level + coffee.phase.name) so samples can be
+# filtered/grouped by shot, grind level and phase; the cumulative Sums stay
+# attribute-free to keep their series mergeable. One exemplar per point links it
+# to the active / just-finished shot trace.
+otlp.NumberDataPoint.attributes max_count:3
+otlp.NumberDataPoint.exemplars max_count:1
+otlp.Exemplar.span_id max_size:8
+otlp.Exemplar.trace_id max_size:16
 otlp.Gauge.data_points max_count:1
+otlp.Sum.data_points max_count:1
 otlp.Metric.name max_size:48
 otlp.Metric.description max_size:2
 otlp.Metric.unit max_size:12
-otlp.ScopeMetrics.metrics max_count:10
+otlp.ScopeMetrics.metrics max_count:14
 otlp.ResourceMetrics.scope_metrics max_count:1
 otlp.ExportMetricsServiceRequest.resource_metrics max_count:1
 
@@ -39,8 +47,8 @@ otlp.Span.span_id max_size:8
 otlp.Span.parent_span_id max_size:8
 otlp.Span.trace_state max_size:2
 otlp.Span.name max_size:32
-otlp.Span.attributes max_count:8
-otlp.Span.events max_count:4
+otlp.Span.attributes max_count:20
+otlp.Span.events max_count:2
 otlp.ScopeSpans.spans max_count:1
 otlp.ResourceSpans.scope_spans max_count:1
 otlp.ExportTraceServiceRequest.resource_spans max_count:1

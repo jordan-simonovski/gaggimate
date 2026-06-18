@@ -19,7 +19,7 @@ constexpr int TEMP_HISTORY_LENGTH = 20 * 1000 / TEMP_HISTORY_INTERVAL;
 
 int16_t calculate_angle(int set_temp, int range, int offset);
 
-enum class BrewScreenState { Brew, Settings };
+enum class BrewScreenState { Brew, Settings, GrindDose };
 
 class DefaultUI {
   public:
@@ -121,6 +121,9 @@ class DefaultUI {
     float targetVolume = 0;
     int grindDuration = 0;
     float grindVolume = 0.0f;
+    float grindLevel = 0.0f;
+    int grinderModel = 0;
+    float doseWeight = 0.0f;
     int pressureAvailable = 0;
     float pressure = 0.0f;
     int pressureScaling = DEFAULT_PRESSURE_SCALING;

@@ -34,11 +34,16 @@ class Controller {
     void setPumpModelCoeffs();
     void setTargetGrindDuration(int duration);
     void setTargetGrindVolume(double volume);
+    void setGrindLevel(double level);
+    void setDoseWeight(double weight);
 
     int getMode() const;
 
     float getTargetTemp() const;
     int getTargetGrindDuration() const;
+    int getGrinderModel() const;
+    double getGrindLevel() const;
+    double getDoseWeight() const;
     virtual float getCurrentTemp() const { return currentTemp; }
     bool isActive() const;
     bool isGrindActive() const;
@@ -75,6 +80,10 @@ class Controller {
     void lowerBrewTarget();
     void raiseGrindTarget();
     void lowerGrindTarget();
+    void raiseGrindLevel();
+    void lowerGrindLevel();
+    void raiseDoseWeight();
+    void lowerDoseWeight();
     void activate();
     void deactivate();
     void clear();

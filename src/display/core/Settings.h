@@ -60,6 +60,9 @@ class Settings {
     float getPressureScaling() const { return pressureScaling; }
     double getTargetGrindVolume() const { return targetGrindVolume; }
     int getTargetGrindDuration() const { return targetGrindDuration; }
+    int getGrinderModel() const { return grinderModel; }
+    double getGrindLevel() const { return grindLevel; }
+    double getDoseWeight() const { return doseWeight; }
     int getStartupMode() const { return startupMode; }
     int getStandbyTimeout() const { return standbyTimeout; }
     double getBrewDelay() const { return brewDelay; }
@@ -139,6 +142,9 @@ class Settings {
     void setPressureScaling(float pressure_scaling);
     void setTargetGrindVolume(double target_grind_volume);
     void setTargetGrindDuration(int target_duration);
+    void setGrinderModel(int grinder_model);
+    void setGrindLevel(double grind_level);
+    void setDoseWeight(double dose_weight);
     void setStartupMode(int startup_mode);
     void setStandbyTimeout(int standby_timeout);
     void setBrewDelay(double brewDelay);
@@ -221,6 +227,9 @@ class Settings {
     float pressureScaling = DEFAULT_PRESSURE_SCALING;
     double targetGrindVolume = 18;
     int targetGrindDuration = 25000;
+    int grinderModel = 0;   // index into GRINDERS table (Grinders.h)
+    double grindLevel = 0.0; // last-used grind level, clamped to the grinder scale
+    double doseWeight = 18.0; // last-used dose (grams of coffee in)
     double brewDelay = 1000.0;
     double grindDelay = 1000.0;
     bool delayAdjust = true;

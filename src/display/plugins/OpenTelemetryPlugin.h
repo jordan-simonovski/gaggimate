@@ -37,6 +37,7 @@ class OpenTelemetryPlugin : public Plugin {
         float pumpFlow = 0.0f;
         float puckFlow = 0.0f;
         float puckResistance = 0.0f;
+        bool puckResistanceValid = false;
         float weight = 0.0f;
         bool haveWeight = false;
     };
@@ -50,6 +51,10 @@ class OpenTelemetryPlugin : public Plugin {
         uint64_t startNanos = 0;
         float peakPressure = 0.0f;
         float peakFlow = 0.0f;
+        double pressureSum = 0.0; // running averages over the phase
+        uint32_t pressureCount = 0;
+        double flowSum = 0.0;
+        uint32_t flowCount = 0;
     };
 
     void onBrewStart();
@@ -63,6 +68,9 @@ class OpenTelemetryPlugin : public Plugin {
     bool postOtlp(const char *signalPath, const uint8_t *body, size_t len);
     bool sendPost(HTTPClient &http, const uint8_t *body, size_t len) const;
     std::vector<otel::Attribute> buildResourceAttributes() const;
+    // Rebuilds the cached resource attributes / scope version on the main thread
+    // (reads controller SystemInfo Strings, which the export task must not touch).
+    void refreshMetadata();
 
     void lock() const {
         if (mutex)
@@ -88,6 +96,8 @@ class OpenTelemetryPlugin : public Plugin {
     float peakFlow = 0.0f;
     float maxWeight = 0.0f;
     float shotTargetTemp = 0.0f;
+    float shotGrindLevel = 0.0f;
+    float shotDoseWeight = 0.0f;
     bool shotVolumetric = false;
     String shotProfileLabel;
     String shotProfileType;
@@ -97,6 +107,47 @@ class OpenTelemetryPlugin : public Plugin {
     std::vector<PhaseSpan> phases;
     int activePhase = -1;
 
+    // Shot-level running aggregates (guarded by mutex, reset each shot). Sums use
+    // double so accumulation over a few hundred samples stays accurate.
+    double pressureSum = 0.0;
+    uint32_t pressureCount = 0;
+    double pressureErrSum = 0.0; // Σ|measured - target| for profile adherence
+    uint32_t pressureErrCount = 0;
+    double flowSum = 0.0;
+    uint32_t flowCount = 0;
+    double flowErrSum = 0.0;
+    uint32_t flowErrCount = 0;
+    double tempSum = 0.0;
+    uint32_t tempCount = 0;
+    float tempMin = 0.0f;
+    float tempMax = 0.0f;
+    double resistanceSum = 0.0;
+    double resistanceSumSq = 0.0;
+    uint32_t resistanceCount = 0;
+    unsigned long firstFlowMillis = 0; // 0 until puck flow first crosses threshold
+
+    static constexpr float FIRST_FLOW_THRESHOLD_MLS = 0.5f;
+    // Puck resistance is only physical during extraction (order 1-100). The
+    // firmware reports 1e7 / INFINITY as a "no estimate" sentinel; reject
+    // anything non-finite or above this bound so it never reaches telemetry.
+    static constexpr float RESISTANCE_SANE_MAX = 1.0e6f;
+
+    // Cumulative monotonic counters since boot (guarded by mutex). Exported as
+    // OTLP Sums alongside the gauges. metricsStartNanos is the counter epoch.
+    uint64_t shotsTotal = 0;
+    double brewSecondsTotal = 0.0;
+    double waterTotalMl = 0.0;
+    uint64_t wifiDisconnectsTotal = 0;
+    uint64_t bleDisconnectsTotal = 0;
+    unsigned long lastFlowMillis = 0; // for trapezoidal water integration
+    uint64_t metricsStartNanos = 0;
+
+    // Trace ids of the most recently completed shot, attached as exemplars to
+    // the shot-driven counters so metrics link back to the shot trace.
+    uint8_t lastShotTraceId[16]{};
+    uint8_t lastShotSpanId[8]{};
+    bool haveLastShot = false;
+
     QueueHandle_t spanQueue = nullptr; // holds otel::SpanData*
 
     bool metricsEnabled = false;
@@ -104,6 +155,11 @@ class OpenTelemetryPlugin : public Plugin {
     String endpoint;
     String headers;
     int intervalS = 10;
+
+    // Cached identity, refreshed on the main thread; copied under lock by the
+    // export task so it never reads controller-owned Strings cross-thread.
+    std::vector<otel::Attribute> resourceAttrs;
+    String scopeVersion;
 
     TaskHandle_t taskHandle = nullptr;
     uint8_t *buffer = nullptr;

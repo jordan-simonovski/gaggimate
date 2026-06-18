@@ -11,6 +11,7 @@ import {
   SettingsFormField,
   ToggleField,
 } from '../../components/SettingsFormField.jsx';
+import { grinders } from '../../config/grinders.js';
 import { timezones } from '../../config/zones.js';
 import { ApiServiceContext, machine } from '../../services/ApiService.js';
 import { DASHBOARD_LAYOUTS, setDashboardLayout } from '../../utils/dashboardManager.js';
@@ -252,6 +253,10 @@ export function Settings() {
       formDataToSubmit.set(
         'altRelayFunction',
         formData.altRelayFunction !== undefined ? formData.altRelayFunction : 1,
+      );
+      formDataToSubmit.set(
+        'grinderModel',
+        formData.grinderModel !== undefined ? formData.grinderModel : 0,
       );
       formDataToSubmit.set(
         'buttonBehavior',
@@ -892,6 +897,25 @@ export function Settings() {
                 </div>
               </SettingsFormField>
             )}
+            <SettingsFormField
+              label='Grinder'
+              htmlFor='grinderModel'
+              helpText='Determines the grind level scale shown on the brew screen.'
+            >
+              <select
+                id='grinderModel'
+                name='grinderModel'
+                className='select select-bordered w-full'
+                value={formData.grinderModel ?? 0}
+                onChange={onChange('grinderModel')}
+              >
+                {grinders.map((g, idx) => (
+                  <option key={idx} value={idx}>
+                    {g.name}
+                  </option>
+                ))}
+              </select>
+            </SettingsFormField>
             <SettingsFormField
               label='Alt Relay / SSR2 Function'
               htmlFor='altRelayFunction'
