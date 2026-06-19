@@ -56,6 +56,13 @@ void OpenTelemetryPlugin::setup(Controller *ctrl, PluginManager *pluginManager) 
     intervalS = settings.getOtelInterval();
     if (intervalS < 1)
         intervalS = 1;
+    // Spread MAX_GAUGE_POINTS samples across the export window, but never finer
+    // than the floor. This bounds the batch (and the static encoder struct)
+    // regardless of how large the user sets the export interval.
+    const unsigned long intervalMs = static_cast<unsigned long>(intervalS) * 1000UL;
+    sampleIntervalMs = intervalMs / MAX_GAUGE_POINTS;
+    if (sampleIntervalMs < SAMPLE_INTERVAL_FLOOR_MS)
+        sampleIntervalMs = SAMPLE_INTERVAL_FLOOR_MS;
 
     if (!metricsEnabled && !tracesEnabled)
         return;
@@ -434,6 +441,7 @@ void OpenTelemetryPlugin::exportTaskFn(void *arg) { static_cast<OpenTelemetryPlu
 
 void OpenTelemetryPlugin::exportLoop() {
     unsigned long lastMetric = 0;
+    unsigned long lastSample = 0;
     for (;;) {
         if (tracesEnabled) {
             otel::SpanData *span = nullptr;
@@ -446,13 +454,45 @@ void OpenTelemetryPlugin::exportLoop() {
         }
         if (metricsEnabled) {
             const unsigned long now = millis();
+            if (now - lastSample >= sampleIntervalMs) {
+                lastSample = now;
+                captureSample();
+            }
             if (now - lastMetric >= static_cast<unsigned long>(intervalS) * 1000UL) {
                 lastMetric = now;
                 exportMetrics();
             }
         }
-        vTaskDelay(200 / portTICK_PERIOD_MS);
+        // 100ms tick keeps the ~500ms sampler close to its target despite jitter
+        // while staying cheap (each tick is a couple of comparisons).
+        vTaskDelay(100 / portTICK_PERIOD_MS);
     }
+}
+
+void OpenTelemetryPlugin::captureSample() {
+    // Timestamps must be real wall-clock; until SNTP sets the clock, skip so the
+    // batch never carries garbage times.
+    if (!clockValid())
+        return;
+    GaugeSample sample;
+    sample.timeNanos = nowUnixNanos();
+    lock();
+    sample.snap = snapshot;
+    sample.inShot = shotActive;
+    sample.grindLevel = shotGrindLevel;
+    memcpy(sample.traceId, traceId, sizeof(sample.traceId));
+    memcpy(sample.spanId, spanId, sizeof(sample.spanId));
+    if (shotActive && activePhase >= 0 && activePhase < static_cast<int>(phases.size()))
+        strlcpy(sample.phase, phases[activePhase].name.c_str(), sizeof(sample.phase));
+    unlock();
+
+    if (sampleCount >= MAX_GAUGE_POINTS) {
+        // Ring full (timing jitter landed an extra sample before the flush): drop
+        // the oldest so the most recent signal always survives.
+        memmove(&sampleRing[0], &sampleRing[1], (MAX_GAUGE_POINTS - 1) * sizeof(GaugeSample));
+        sampleCount = MAX_GAUGE_POINTS - 1;
+    }
+    sampleRing[sampleCount++] = sample;
 }
 
 std::vector<otel::Attribute> OpenTelemetryPlugin::buildResourceAttributes() const {
@@ -490,17 +530,13 @@ void OpenTelemetryPlugin::exportMetrics() {
     }
 
     const uint64_t now = nowUnixNanos();
-    Snapshot s;
     uint64_t shots, wifiDc, bleDc, startNanos;
     double brewSecs, waterMl;
-    bool inShot, haveLast;
-    uint8_t curTid[16], curSid[8], lastTid[16], lastSid[8];
+    bool haveLast;
+    uint8_t lastTid[16], lastSid[8];
     std::vector<otel::Attribute> resAttrs;
     String version;
-    String phaseName;
-    float shotGl = 0.0f;
     lock();
-    s = snapshot;
     if (metricsStartNanos == 0)
         metricsStartNanos = now;
     startNanos = metricsStartNanos;
@@ -509,12 +545,6 @@ void OpenTelemetryPlugin::exportMetrics() {
     waterMl = waterTotalMl;
     wifiDc = wifiDisconnectsTotal;
     bleDc = bleDisconnectsTotal;
-    inShot = shotActive;
-    shotGl = shotGrindLevel;
-    if (shotActive && activePhase >= 0 && activePhase < static_cast<int>(phases.size()))
-        phaseName = phases[activePhase].name;
-    memcpy(curTid, traceId, sizeof(curTid));
-    memcpy(curSid, spanId, sizeof(curSid));
     haveLast = haveLastShot;
     memcpy(lastTid, lastShotTraceId, sizeof(lastTid));
     memcpy(lastSid, lastShotSpanId, sizeof(lastSid));
@@ -522,54 +552,109 @@ void OpenTelemetryPlugin::exportMetrics() {
     version = scopeVersion;
     unlock();
 
-    auto setExemplar = [](otel::MetricPoint &m, const uint8_t *tid, const uint8_t *sid) {
-        m.hasExemplar = true;
-        memcpy(m.traceId, tid, sizeof(m.traceId));
-        memcpy(m.spanId, sid, sizeof(m.spanId));
+    using MS = otel::MetricSeries;
+    std::vector<MS> metrics;
+
+    // Build a gauge series from the batched samples. `extract` returns false for
+    // a sample that should be skipped (e.g. no weight reading), so absent
+    // signals stay absent rather than emitting a stale zero. In-shot samples
+    // carry shot id + grind level + phase (taken at sample time, so a phase
+    // change mid-batch is attributed correctly) and an exemplar to the shot span.
+    auto addGauge = [&](const char *name, const char *unit, auto extract) {
+        MS series;
+        series.name = name;
+        series.unit = unit;
+        series.kind = MS::GAUGE;
+        series.points.reserve(sampleCount);
+        for (size_t i = 0; i < sampleCount; i++) {
+            const GaugeSample &smp = sampleRing[i];
+            double value;
+            if (!extract(smp.snap, value))
+                continue;
+            otel::DataPoint dp;
+            dp.timeNanos = smp.timeNanos;
+            dp.value = value;
+            if (smp.inShot) {
+                dp.attributes.push_back(otel::Attribute::str("coffee.shot.id", traceIdHex(smp.traceId, 16)));
+                dp.attributes.push_back(otel::Attribute::dbl("coffee.grind.level", smp.grindLevel));
+                if (smp.phase[0] != '\0')
+                    dp.attributes.push_back(otel::Attribute::str("coffee.phase.name", smp.phase));
+                dp.hasExemplar = true;
+                memcpy(dp.traceId, smp.traceId, sizeof(dp.traceId));
+                memcpy(dp.spanId, smp.spanId, sizeof(dp.spanId));
+            }
+            series.points.push_back(std::move(dp));
+        }
+        if (!series.points.empty())
+            metrics.push_back(std::move(series));
     };
 
-    using MP = otel::MetricPoint;
-    std::vector<MP> metrics;
-    metrics.push_back({"coffee.boiler.temperature", "Cel", s.temp});
-    metrics.push_back({"coffee.boiler.target_temperature", "Cel", s.targetTemp});
-    metrics.push_back({"coffee.boiler.pressure", "bar", s.pressure});
-    metrics.push_back({"coffee.pump.flow", "ml/s", s.pumpFlow});
-    metrics.push_back({"coffee.pump.puck_flow", "ml/s", s.puckFlow});
-    if (s.puckResistanceValid)
-        metrics.push_back({"coffee.pump.puck_resistance", "", s.puckResistance});
-    if (s.haveWeight)
-        metrics.push_back({"coffee.scale.weight", "g", s.weight});
-    const size_t gaugeCount = metrics.size();
-    // Cumulative monotonic counters (Sums).
-    metrics.push_back({"coffee.shots.total", "{shot}", static_cast<double>(shots), MP::SUM, true});
-    const size_t idxShots = metrics.size() - 1;
-    metrics.push_back({"coffee.brew.duration.total", "s", brewSecs, MP::SUM, true});
-    const size_t idxBrew = metrics.size() - 1;
-    metrics.push_back({"coffee.water.total", "ml", waterMl, MP::SUM, true});
-    metrics.push_back({"coffee.wifi.disconnects.total", "{event}", static_cast<double>(wifiDc), MP::SUM, true});
-    metrics.push_back({"coffee.bluetooth.disconnects.total", "{event}", static_cast<double>(bleDc), MP::SUM, true});
+    addGauge("coffee.boiler.temperature", "Cel", [](const Snapshot &s, double &v) {
+        v = s.temp;
+        return true;
+    });
+    addGauge("coffee.boiler.target_temperature", "Cel", [](const Snapshot &s, double &v) {
+        v = s.targetTemp;
+        return true;
+    });
+    addGauge("coffee.boiler.pressure", "bar", [](const Snapshot &s, double &v) {
+        v = s.pressure;
+        return true;
+    });
+    addGauge("coffee.pump.flow", "ml/s", [](const Snapshot &s, double &v) {
+        v = s.pumpFlow;
+        return true;
+    });
+    addGauge("coffee.pump.puck_flow", "ml/s", [](const Snapshot &s, double &v) {
+        v = s.puckFlow;
+        return true;
+    });
+    addGauge("coffee.pump.puck_resistance", "", [](const Snapshot &s, double &v) {
+        if (!s.puckResistanceValid)
+            return false;
+        v = s.puckResistance;
+        return true;
+    });
+    addGauge("coffee.scale.weight", "g", [](const Snapshot &s, double &v) {
+        if (!s.haveWeight)
+            return false;
+        v = s.weight;
+        return true;
+    });
 
-    // While a shot is in flight, the live gauges belong to its trace and its
-    // current phase. Tag them with shot id + phase name (so samples can be
-    // grouped/filtered per shot/phase) and an exemplar to the shot span. The
-    // cumulative Sums stay attribute-free so their series remain mergeable.
-    if (inShot) {
-        const String shotId = traceIdHex(curTid, sizeof(curTid));
-        for (size_t i = 0; i < gaugeCount; i++) {
-            setExemplar(metrics[i], curTid, curSid);
-            metrics[i].attributes.push_back(otel::Attribute::str("coffee.shot.id", shotId));
-            metrics[i].attributes.push_back(otel::Attribute::dbl("coffee.grind.level", shotGl));
-            if (!phaseName.isEmpty())
-                metrics[i].attributes.push_back(otel::Attribute::str("coffee.phase.name", phaseName));
+    // Cumulative monotonic counters (Sums): one point at the export instant. The
+    // shot/brew counters carry an exemplar to the last completed shot trace; the
+    // rest stay attribute-free so their series remain mergeable across reboots.
+    auto addSum = [&](const char *name, const char *unit, double value, bool exemplar) {
+        MS series;
+        series.name = name;
+        series.unit = unit;
+        series.kind = MS::SUM;
+        series.monotonic = true;
+        otel::DataPoint dp;
+        dp.timeNanos = now;
+        dp.value = value;
+        if (exemplar) {
+            dp.hasExemplar = true;
+            memcpy(dp.traceId, lastTid, sizeof(dp.traceId));
+            memcpy(dp.spanId, lastSid, sizeof(dp.spanId));
         }
-    }
-    if (haveLast) {
-        setExemplar(metrics[idxShots], lastTid, lastSid);
-        setExemplar(metrics[idxBrew], lastTid, lastSid);
-    }
+        series.points.push_back(std::move(dp));
+        metrics.push_back(std::move(series));
+    };
+    addSum("coffee.shots.total", "{shot}", static_cast<double>(shots), haveLast);
+    addSum("coffee.brew.duration.total", "s", brewSecs, haveLast);
+    addSum("coffee.water.total", "ml", waterMl, false);
+    addSum("coffee.wifi.disconnects.total", "{event}", static_cast<double>(wifiDc), false);
+    addSum("coffee.bluetooth.disconnects.total", "{event}", static_cast<double>(bleDc), false);
 
-    const size_t len = otel::OtlpEncoder::encodeMetrics(resAttrs, SCOPE_NAME, version, metrics, now, startNanos, buffer,
-                                                        BUFFER_SIZE);
+    // Batch consumed (points were copied into `metrics`); reset the ring for the
+    // next window. The sampler and this flush both run on the export task, so the
+    // reset can't race a concurrent capture.
+    sampleCount = 0;
+
+    const size_t len =
+        otel::OtlpEncoder::encodeMetrics(resAttrs, SCOPE_NAME, version, metrics, startNanos, buffer, BUFFER_SIZE);
     if (len == 0) {
         ESP_LOGW(OTEL_TAG, "Failed to encode metrics");
         return;

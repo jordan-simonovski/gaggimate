@@ -5,6 +5,21 @@
 #include <esp_heap_caps.h>
 #include <pb_encode.h>
 
+// Compile-time guard against nanopb's hard limit: field offsets are encoded in
+// 16 bits, so a single generated message struct must stay under 64KB (see
+// PB_FITS in pb.h). Raising otlp.Gauge.data_points or adding metrics inflates
+// these structs; if one approaches the cap the build fails here with a readable
+// reason instead of nanopb's cryptic FIELDINFO_DOES_NOT_FIT assert. The margin
+// means we notice before hitting the wall. The full sample batch is split into
+// chunks at encode time precisely so these stay small (see encodeMetrics).
+static_assert(sizeof(otlp_ScopeMetrics) <= 60u * 1024u,
+              "otlp_ScopeMetrics approaching nanopb's 64KB message cap: reduce ScopeMetrics.metrics or "
+              "otlp.Gauge.data_points in otlp.options");
+static_assert(sizeof(otlp_ResourceMetrics) <= 60u * 1024u,
+              "otlp_ResourceMetrics approaching nanopb's 64KB message cap");
+static_assert(sizeof(otlp_ExportMetricsServiceRequest) <= 60u * 1024u,
+              "otlp_ExportMetricsServiceRequest approaching nanopb's 64KB message cap");
+
 namespace otel {
 
 namespace {
@@ -50,14 +65,39 @@ pb_size_t fillAttributes(otlp_KeyValue *dst, pb_size_t cap, const std::vector<At
 
 } // namespace
 
-size_t OtlpEncoder::encodeMetrics(const std::vector<Attribute> &resourceAttrs, const String &scopeName,
-                                  const String &scopeVersion, const std::vector<MetricPoint> &metrics, uint64_t timeNanos,
-                                  uint64_t startTimeNanos, uint8_t *buf, size_t bufSize) {
+namespace {
+
+// Fills one NumberDataPoint from a DataPoint. start is written only for SUM
+// points (proto3 zero is omitted for gauges, which is what we want).
+void fillDataPoint(otlp_NumberDataPoint &dp, const DataPoint &src, uint64_t start) {
+    dp.start_time_unix_nano = start;
+    dp.time_unix_nano = src.timeNanos;
+    dp.which_value = otlp_NumberDataPoint_as_double_tag;
+    dp.value.as_double = src.value;
+    dp.attributes_count =
+        fillAttributes(dp.attributes, sizeof(dp.attributes) / sizeof(dp.attributes[0]), src.attributes);
+    if (src.hasExemplar) {
+        dp.exemplars_count = 1;
+        otlp_Exemplar &ex = dp.exemplars[0];
+        ex.time_unix_nano = src.timeNanos;
+        ex.as_double = src.value;
+        ex.span_id.size = sizeof(ex.span_id.bytes);
+        memcpy(ex.span_id.bytes, src.spanId, sizeof(ex.span_id.bytes));
+        ex.trace_id.size = sizeof(ex.trace_id.bytes);
+        memcpy(ex.trace_id.bytes, src.traceId, sizeof(ex.trace_id.bytes));
+    }
+}
+
+// Encodes one ExportMetricsServiceRequest (one ResourceMetrics) covering gauge
+// points [pointOffset, pointOffset + chunkCap) of each series. SUM series are
+// emitted only when includeSums is set (so cumulative counters appear exactly
+// once across the chunked output). Returns bytes written, or 0 on failure.
+size_t encodeChunk(const std::vector<Attribute> &resourceAttrs, const String &scopeName, const String &scopeVersion,
+                   const std::vector<MetricSeries> &metrics, uint64_t startTimeNanos, size_t pointOffset,
+                   bool includeSums, uint8_t *buf, size_t bufSize) {
     auto *req = static_cast<otlp_ExportMetricsServiceRequest *>(otlpAlloc(sizeof(otlp_ExportMetricsServiceRequest)));
     if (req == nullptr)
         return 0;
-    // init_zero is all-zeros for these messages; memset avoids the brace-init
-    // assignment that C++ rejects on the generated aggregate types.
     memset(req, 0, sizeof(*req));
 
     req->resource_metrics_count = 1;
@@ -73,47 +113,81 @@ size_t OtlpEncoder::encodeMetrics(const std::vector<Attribute> &resourceAttrs, c
     strlcpy(sm.scope.version, scopeVersion.c_str(), sizeof(sm.scope.version));
 
     const pb_size_t metricCap = sizeof(sm.metrics) / sizeof(sm.metrics[0]);
-    pb_size_t nm = metrics.size() < metricCap ? static_cast<pb_size_t>(metrics.size()) : metricCap;
-    sm.metrics_count = nm;
-    for (pb_size_t j = 0; j < nm; j++) {
-        otlp_Metric &m = sm.metrics[j];
-        strlcpy(m.name, metrics[j].name.c_str(), sizeof(m.name));
-        strlcpy(m.unit, metrics[j].unit.c_str(), sizeof(m.unit));
-        otlp_NumberDataPoint *dp = nullptr;
-        if (metrics[j].kind == MetricPoint::SUM) {
+    pb_size_t nm = 0;
+    for (size_t j = 0; j < metrics.size() && nm < metricCap; j++) {
+        const MetricSeries &series = metrics[j];
+        if (series.kind == MetricSeries::SUM) {
+            if (!includeSums || series.points.empty())
+                continue;
+            otlp_Metric &m = sm.metrics[nm];
+            strlcpy(m.name, series.name.c_str(), sizeof(m.name));
+            strlcpy(m.unit, series.unit.c_str(), sizeof(m.unit));
             m.which_data = otlp_Metric_sum_tag;
             m.data.sum.aggregation_temporality = otlp_AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE;
-            m.data.sum.is_monotonic = metrics[j].monotonic;
+            m.data.sum.is_monotonic = series.monotonic;
             m.data.sum.data_points_count = 1;
-            dp = &m.data.sum.data_points[0];
-            dp->start_time_unix_nano = startTimeNanos;
-        } else {
-            m.which_data = otlp_Metric_gauge_tag;
-            m.data.gauge.data_points_count = 1;
-            dp = &m.data.gauge.data_points[0];
+            fillDataPoint(m.data.sum.data_points[0], series.points[0], startTimeNanos);
+            nm++;
+            continue;
         }
-        dp->time_unix_nano = timeNanos;
-        dp->which_value = otlp_NumberDataPoint_as_double_tag;
-        dp->value.as_double = metrics[j].value;
-        dp->attributes_count =
-            fillAttributes(dp->attributes, sizeof(dp->attributes) / sizeof(dp->attributes[0]), metrics[j].attributes);
-        if (metrics[j].hasExemplar) {
-            dp->exemplars_count = 1;
-            otlp_Exemplar &ex = dp->exemplars[0];
-            ex.time_unix_nano = timeNanos;
-            ex.as_double = metrics[j].value;
-            ex.span_id.size = sizeof(ex.span_id.bytes);
-            memcpy(ex.span_id.bytes, metrics[j].spanId, sizeof(ex.span_id.bytes));
-            ex.trace_id.size = sizeof(ex.trace_id.bytes);
-            memcpy(ex.trace_id.bytes, metrics[j].traceId, sizeof(ex.trace_id.bytes));
-        }
+        // GAUGE: take this chunk's window of points, skip the metric if empty.
+        const pb_size_t cap =
+            sizeof(sm.metrics[nm].data.gauge.data_points) / sizeof(sm.metrics[nm].data.gauge.data_points[0]);
+        if (pointOffset >= series.points.size())
+            continue;
+        const size_t remaining = series.points.size() - pointOffset;
+        const pb_size_t np = remaining < cap ? static_cast<pb_size_t>(remaining) : cap;
+        if (np == 0)
+            continue;
+        otlp_Metric &m = sm.metrics[nm];
+        strlcpy(m.name, series.name.c_str(), sizeof(m.name));
+        strlcpy(m.unit, series.unit.c_str(), sizeof(m.unit));
+        m.which_data = otlp_Metric_gauge_tag;
+        for (pb_size_t i = 0; i < np; i++)
+            fillDataPoint(m.data.gauge.data_points[i], series.points[pointOffset + i], 0);
+        m.data.gauge.data_points_count = np;
+        nm++;
     }
+    sm.metrics_count = nm;
 
     pb_ostream_t os = pb_ostream_from_buffer(buf, bufSize);
     bool ok = pb_encode(&os, &otlp_ExportMetricsServiceRequest_msg, req);
     size_t len = ok ? os.bytes_written : 0;
     free(req);
     return len;
+}
+
+} // namespace
+
+size_t OtlpEncoder::encodeMetrics(const std::vector<Attribute> &resourceAttrs, const String &scopeName,
+                                  const String &scopeVersion, const std::vector<MetricSeries> &metrics,
+                                  uint64_t startTimeNanos, uint8_t *buf, size_t bufSize) {
+    // Per-chunk gauge capacity is the generated data_points array size (kept
+    // small so each ScopeMetrics struct stays under nanopb's 64KB cap). The full
+    // batch is emitted as back-to-back ExportMetricsServiceRequest messages;
+    // concatenating serialized protobufs of the same type is itself a valid
+    // message (repeated resource_metrics concatenate), so the collector sees one
+    // request with several ResourceMetrics.
+    constexpr size_t chunkCap = sizeof(otlp_Gauge::data_points) / sizeof(otlp_NumberDataPoint);
+
+    size_t maxGaugePoints = 0;
+    for (const MetricSeries &s : metrics)
+        if (s.kind == MetricSeries::GAUGE && s.points.size() > maxGaugePoints)
+            maxGaugePoints = s.points.size();
+
+    size_t total = 0;
+    bool first = true;
+    for (size_t offset = 0; first || offset < maxGaugePoints; offset += chunkCap) {
+        const size_t len = encodeChunk(resourceAttrs, scopeName, scopeVersion, metrics, startTimeNanos, offset,
+                                       /*includeSums=*/first, buf + total, bufSize - total);
+        if (len == 0)
+            return first ? 0 : total; // first chunk failing means nothing usable
+        total += len;
+        first = false;
+        if (offset + chunkCap >= maxGaugePoints)
+            break;
+    }
+    return total;
 }
 
 size_t OtlpEncoder::encodeTrace(const std::vector<Attribute> &resourceAttrs, const String &scopeName,

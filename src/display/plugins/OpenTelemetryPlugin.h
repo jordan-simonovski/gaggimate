@@ -57,12 +57,27 @@ class OpenTelemetryPlugin : public Plugin {
         uint32_t flowCount = 0;
     };
 
+    // One captured instant of the live gauges plus the shot identity at sample
+    // time. The export task samples these into a ring at ~500ms and ships the
+    // batch every intervalS, so a fast-moving signal (scale weight especially)
+    // keeps its shape without extra HTTP round-trips.
+    struct GaugeSample {
+        uint64_t timeNanos = 0;
+        Snapshot snap;
+        bool inShot = false;
+        uint8_t traceId[16] = {};
+        uint8_t spanId[8] = {};
+        float grindLevel = 0.0f;
+        char phase[24] = {}; // phase name at sample time, empty when none
+    };
+
     void onBrewStart();
     void onBrewEnd();
     void onBrewPhase(int index);
 
     static void exportTaskFn(void *arg);
     void exportLoop();
+    void captureSample();
     void exportMetrics();
     void exportSpan(otel::SpanData *span);
     bool postOtlp(const char *signalPath, const uint8_t *body, size_t len);
@@ -150,11 +165,25 @@ class OpenTelemetryPlugin : public Plugin {
 
     QueueHandle_t spanQueue = nullptr; // holds otel::SpanData*
 
+    // Max timestamped points batched per gauge per export. Must stay <=
+    // otlp.Gauge.data_points in otlp.options (encoder caps to that array). The
+    // sampler derives its cadence so this is never exceeded for any interval.
+    static constexpr size_t MAX_GAUGE_POINTS = 20;
+    // Floor for the internal sample cadence. Finer than this buys little for the
+    // signals we track and just inflates payloads.
+    static constexpr unsigned long SAMPLE_INTERVAL_FLOOR_MS = 500;
+
     bool metricsEnabled = false;
     bool tracesEnabled = false;
     String endpoint;
     String headers;
     int intervalS = 10;
+    // Live gauges are sampled every sampleIntervalMs into sampleRing and flushed
+    // every intervalS. The ring is owned by the export task (sampled + flushed
+    // there), so it needs no lock; only the shared snapshot read is guarded.
+    unsigned long sampleIntervalMs = SAMPLE_INTERVAL_FLOOR_MS;
+    GaugeSample sampleRing[MAX_GAUGE_POINTS];
+    size_t sampleCount = 0;
 
     // Cached identity, refreshed on the main thread; copied under lock by the
     // export task so it never reads controller-owned Strings cross-thread.
@@ -164,7 +193,10 @@ class OpenTelemetryPlugin : public Plugin {
     TaskHandle_t taskHandle = nullptr;
     uint8_t *buffer = nullptr;
 
-    static constexpr size_t BUFFER_SIZE = 8192;
+    // Sized for the worst case: MAX_GAUGE_POINTS in-shot points across every
+    // gauge, each carrying 3 attributes + an exemplar (~200B/point on the wire).
+    // PSRAM-backed; falls back to internal heap if PSRAM is unavailable.
+    static constexpr size_t BUFFER_SIZE = 40960;
 };
 
 #endif // OPENTELEMETRYPLUGIN_H

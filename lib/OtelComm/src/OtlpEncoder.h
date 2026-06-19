@@ -52,23 +52,33 @@ struct Attribute {
     }
 };
 
-// One metric (one data point) for the current export tick. GAUGE is an
-// instantaneous reading; SUM is a cumulative monotonic counter (e.g. shots
-// total) carrying a start time so backends can compute rates.
-struct MetricPoint {
-    enum Kind { GAUGE, SUM };
-    String name;
-    String unit;
+// One timestamped sample within a metric series. Each carries its own
+// time_unix_nano so a gauge can ship a dense batch (e.g. 500ms samples) in a
+// single export. Attributes/exemplar are per-point because OTLP series identity
+// is per data point (phase.name can change mid-batch).
+struct DataPoint {
+    uint64_t timeNanos = 0;
     double value = 0.0;
-    Kind kind = GAUGE;
-    bool monotonic = false; // only meaningful for SUM
+    // Optional per-point attributes (e.g. coffee.shot.id, coffee.phase.name).
+    // Capped by otlp.NumberDataPoint.attributes in otlp.options.
+    std::vector<Attribute> attributes;
     // Optional exemplar linking this point to a trace (metrics -> traces).
     bool hasExemplar = false;
     uint8_t traceId[16] = {};
     uint8_t spanId[8] = {};
-    // Optional per-point attributes (e.g. coffee.shot.id, coffee.phase.name).
-    // Capped by otlp.NumberDataPoint.attributes in otlp.options.
-    std::vector<Attribute> attributes;
+};
+
+// One metric series for the current export tick. GAUGE carries a batch of
+// instantaneous readings (points); SUM is a cumulative monotonic counter (e.g.
+// shots total) carrying a start time so backends can compute rates, and uses a
+// single point. Point counts are capped by otlp.{Gauge,Sum}.data_points.
+struct MetricSeries {
+    enum Kind { GAUGE, SUM };
+    String name;
+    String unit;
+    Kind kind = GAUGE;
+    bool monotonic = false; // only meaningful for SUM
+    std::vector<DataPoint> points;
 };
 
 struct SpanEventData {
@@ -94,10 +104,11 @@ class OtlpEncoder {
   public:
     // Encode an ExportMetricsServiceRequest. Returns the encoded byte count, or
     // 0 on failure (buffer too small / out of memory).
-    // startTimeNanos is the cumulative-counter start (process/collector start);
-    // it is only written for SUM points. Gauges ignore it.
+    // Each point carries its own time_unix_nano. startTimeNanos is the
+    // cumulative-counter start (process/collector start); it is only written for
+    // SUM points. Gauges ignore it.
     static size_t encodeMetrics(const std::vector<Attribute> &resourceAttrs, const String &scopeName,
-                                const String &scopeVersion, const std::vector<MetricPoint> &metrics, uint64_t timeNanos,
+                                const String &scopeVersion, const std::vector<MetricSeries> &metrics,
                                 uint64_t startTimeNanos, uint8_t *buf, size_t bufSize);
 
     // Encode an ExportTraceServiceRequest carrying a single span.

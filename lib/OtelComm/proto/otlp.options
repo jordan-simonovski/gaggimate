@@ -19,17 +19,30 @@ otlp.InstrumentationScope.version max_size:24
 # Resource identity (service.name/instance.id/version, machine hardware, ...).
 otlp.Resource.attributes max_count:6
 
-# Metrics: one Gauge/Sum per Metric, one point per export tick. Live gauges
+# Metrics: gauges carry a batch of timestamped points per export so the live
+# signal is sampled far finer (~500ms) than the export cadence (default 10s)
+# without extra HTTP round-trips - the scale-weight curve is the motivating
+# case. The export task builds up to 20 points/gauge (OpenTelemetryPlugin
+# MAX_GAUGE_POINTS) and the encoder ships them as several ResourceMetrics
+# chunks of GAUGE_CHUNK_POINTS concatenated into one POST body. Live gauges
 # carry up to three per-point attributes while a shot is in flight
 # (coffee.shot.id + coffee.grind.level + coffee.phase.name) so samples can be
 # filtered/grouped by shot, grind level and phase; the cumulative Sums stay
-# attribute-free to keep their series mergeable. One exemplar per point links it
-# to the active / just-finished shot trace.
+# attribute-free (one point each) to keep their series mergeable. One exemplar
+# per point links it to the active / just-finished shot trace.
+#
+# Sizing note: data_points multiplies the static NumberDataPoint struct
+# (attributes[3] + exemplar dominate). nanopb caps a single message struct at
+# 64KB (field offsets must fit 16 bits; see PB_FITS in pb.h), so data_points is
+# kept small here and the full batch is split across chunks at encode time
+# rather than enabling the global PB_FIELD_32BIT. 8 points x metrics[14] keeps
+# ScopeMetrics ~50KB, comfortably under the limit. Keep GAUGE_CHUNK_POINTS in
+# OtlpEncoder in sync with this cap.
 otlp.NumberDataPoint.attributes max_count:3
 otlp.NumberDataPoint.exemplars max_count:1
 otlp.Exemplar.span_id max_size:8
 otlp.Exemplar.trace_id max_size:16
-otlp.Gauge.data_points max_count:1
+otlp.Gauge.data_points max_count:8
 otlp.Sum.data_points max_count:1
 otlp.Metric.name max_size:48
 otlp.Metric.description max_size:2
