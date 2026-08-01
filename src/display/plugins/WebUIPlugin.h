@@ -17,7 +17,8 @@ constexpr size_t STATUS_PERIOD = 500;
 constexpr size_t DNS_PERIOD = 50;
 
 const String LOCAL_URL = "http://4.4.4.1/";
-const String RELEASE_URL = "https://github.com/jniebuhr/gaggimate/releases/";
+// The releases URL now lives in DEFAULT_OTA_URL (constants.h) since it became a
+// user-settable option; do not reintroduce a second copy here.
 
 class ProfileManager;
 

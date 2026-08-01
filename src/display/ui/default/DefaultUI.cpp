@@ -230,6 +230,10 @@ void DefaultUI::init() {
         targetDuration = profileManager->getSelectedProfile().getTotalDuration();
         targetVolume = profileManager->getSelectedProfile().getTotalVolume();
         profileVolumetric = profileManager->getSelectedProfile().isVolumetric();
+        // Grind settings are per-profile, so they change with the selection.
+        grindLevel = static_cast<float>(controller->getGrindLevel());
+        grinderModel = controller->getGrinderModel();
+        doseWeight = static_cast<float>(controller->getDoseWeight());
         reloadProfiles();
         rerender = true;
     });
@@ -389,9 +393,9 @@ void DefaultUI::setupState() {
     targetVolume = profileManager->getSelectedProfile().getTotalVolume();
     grindDuration = settings.getTargetGrindDuration();
     grindVolume = settings.getTargetGrindVolume();
-    grindLevel = static_cast<float>(settings.getGrindLevel());
+    grindLevel = static_cast<float>(controller->getGrindLevel()); // per-profile, falls back to Settings
     grinderModel = settings.getGrinderModel();
-    doseWeight = static_cast<float>(settings.getDoseWeight());
+    doseWeight = static_cast<float>(controller->getDoseWeight());
     pressureAvailable = controller->getSystemInfo().capabilities.pressure ? 1 : 0;
     pressureScaling = std::ceil(settings.getPressureScaling());
     selectedProfileId = settings.getSelectedProfile();

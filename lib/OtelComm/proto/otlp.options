@@ -36,8 +36,9 @@ otlp.Resource.attributes max_count:6
 # 64KB (field offsets must fit 16 bits; see PB_FITS in pb.h), so data_points is
 # kept small here and the full batch is split across chunks at encode time
 # rather than enabling the global PB_FIELD_32BIT. 8 points x metrics[14] keeps
-# ScopeMetrics ~50KB, comfortably under the limit. Keep GAUGE_CHUNK_POINTS in
-# OtlpEncoder in sync with this cap.
+# ScopeMetrics ~50KB, comfortably under the limit. OtlpEncoder derives its
+# per-chunk point count from sizeof(the generated array), so this cap needs no
+# matching constant on the C++ side.
 otlp.NumberDataPoint.attributes max_count:3
 otlp.NumberDataPoint.exemplars max_count:1
 otlp.Exemplar.span_id max_size:8

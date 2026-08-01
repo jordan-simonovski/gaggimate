@@ -41,6 +41,13 @@ class ShotHistoryPlugin : public Plugin {
     bool createEarlyIndexEntry();
     void saveNotes(const String &id, const JsonDocument &notes);
     void loadNotes(const String &id, JsonDocument &notes);
+    // Seeds the notes file for a finished shot with what the machine already
+    // knows (dose, grind setting, yield) plus the OTel trace ids of the shot
+    // span, so a later rating can be emitted as a linked span.
+    void writeInitialNotes();
+    // Notes files are named by the unpadded shot id (the id the web UI sends),
+    // while shot logs use the zero-padded form.
+    String notesPath(const String &id) const { return "/h/" + String(id.toInt()) + ".json"; }
     void startRecording();
 
     uint16_t getSystemInfo(); // Helper to pack system state bits
@@ -80,6 +87,13 @@ class ShotHistoryPlugin : public Plugin {
     float currentEstimatedWeight = 0.0f;
     float currentPuckResistance = 0.0f;
     String currentProfileName;
+
+    // Trace/span ids of the OTel span emitted for this shot (empty when traces
+    // are disabled). Stored in the notes file so a rating saved later can be
+    // linked back to the shot's trace. Fixed buffers, not Strings: written from
+    // the event-dispatch task and read from this plugin's own task.
+    char currentTraceId[33] = {};
+    char currentSpanId[17] = {};
 
     // Phase transition tracking (v5+)
     uint8_t lastRecordedPhase = 0xFF; // Invalid initial value to detect first phase

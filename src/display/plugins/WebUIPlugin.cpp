@@ -4,6 +4,7 @@
 #include <SD_MMC.h>
 #include <algorithm>
 #include <display/core/Controller.h>
+#include <display/core/Grinders.h>
 #include <display/core/ProfileManager.h>
 #include <display/core/process/BrewProcess.h>
 #include <display/core/process/GrindProcess.h>
@@ -110,7 +111,13 @@ void WebUIPlugin::loop() {
         return;
     }
     const long now = millis();
-    if ((lastUpdateCheck == 0 || now > lastUpdateCheck + UPDATE_CHECK_INTERVAL)) {
+    // checkForUpdates() is a blocking HTTPS round-trip on the shared Arduino
+    // loop, and it competes with BLE for the radio. Neither is acceptable while
+    // a process is running: it stalls the controller comms pump and the scale's
+    // weight stream, which is what weight-based targets brew against. Deferred,
+    // not skipped - lastUpdateCheck stays put, so it runs on the next tick once
+    // the machine is idle again.
+    if ((lastUpdateCheck == 0 || now > lastUpdateCheck + UPDATE_CHECK_INTERVAL) && !controller->isActive()) {
         ota->checkForUpdates();
         pluginManager->trigger("ota:update:status", "value", ota->isUpdateAvailable());
         lastUpdateCheck = now;
@@ -577,7 +584,7 @@ void WebUIPlugin::handleProfileRequest(uint32_t clientId, JsonDocument &request)
 
 void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     if (request->method() == HTTP_POST) {
-        controller->getSettings().batchUpdate([request](Settings *settings) {
+        controller->getSettings().batchUpdate([this, request](Settings *settings) {
             if (request->hasArg("startupMode"))
                 settings->setStartupMode(request->arg("startupMode") == "brew" ? MODE_BREW : MODE_STANDBY);
             if (request->hasArg("startupProfile"))
@@ -615,10 +622,12 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
             // clamped/snapped to the newly selected grinder's scale.
             if (request->hasArg("grinderModel"))
                 settings->setGrinderModel(request->arg("grinderModel").toInt());
+            // Via the controller: grind level/dose are stored on the selected
+            // profile, with the Settings value kept as the machine-wide default.
             if (request->hasArg("grindLevel"))
-                settings->setGrindLevel(request->arg("grindLevel").toDouble());
+                controller->setGrindLevel(request->arg("grindLevel").toDouble());
             if (request->hasArg("doseWeight"))
-                settings->setDoseWeight(request->arg("doseWeight").toDouble());
+                controller->setDoseWeight(request->arg("doseWeight").toDouble());
             settings->setHomeAssistant(request->hasArg("homeAssistant"));
             if (request->hasArg("haUser"))
                 settings->setHomeAssistantUser(request->arg("haUser"));
@@ -764,6 +773,18 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["grinderModel"] = settings.getGrinderModel();
     doc["grindLevel"] = settings.getGrindLevel();
     doc["doseWeight"] = settings.getDoseWeight();
+    // The grinder catalogue is served from the firmware's own table (Grinders.h)
+    // so the Web UI needs no second copy to keep in sync. Index = grinderModel.
+    JsonArray grinderList = doc["grinders"].to<JsonArray>();
+    for (int i = 0; i < GRINDER_COUNT; i++) {
+        const GrinderDef &g = GRINDERS[i];
+        auto entry = grinderList.add<JsonObject>();
+        entry["name"] = g.name;
+        entry["min"] = g.min;
+        entry["max"] = g.max;
+        entry["step"] = g.step;
+        entry["unit"] = g.unit;
+    }
     doc["momentaryButtons"] = settings.isMomentaryButtons();
     doc["brewDelay"] = settings.getBrewDelay();
     doc["grindDelay"] = settings.getGrindDelay();

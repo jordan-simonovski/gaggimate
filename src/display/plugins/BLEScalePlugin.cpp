@@ -31,6 +31,11 @@ BLEScalePlugin::~BLEScalePlugin() noexcept {
         // Disable active flag first to stop processing
         active = false;
 
+        if (taskHandle != nullptr) {
+            vTaskDelete(taskHandle);
+            taskHandle = nullptr;
+        }
+
         // Give any running callbacks time to complete
         delay(100);
 
@@ -60,6 +65,7 @@ void BLEScalePlugin::setup(Controller *controller, PluginManager *manager) {
     this->controller = controller;
     this->pluginManager = manager;
     this->pluginRegistry = RemoteScalesPluginRegistry::getInstance();
+    this->scaleMutex = xSemaphoreCreateMutex();
 
     // Apply scale plugins with error checking
     AcaiaScalesPlugin::apply();
@@ -116,9 +122,27 @@ void BLEScalePlugin::setup(Controller *controller, PluginManager *manager) {
             ESP_LOGI("BLEScalePlugin", "Stopping scanning, disconnecting");
         }
     });
+
+    // Own task, pinned to core 0 alongside the NimBLE host. Connecting to a
+    // scale blocks for seconds and the driver heartbeat must not be late, so
+    // neither can share a loop with OTA checks / web serving.
+    xTaskCreatePinnedToCore(serviceTask, "BLEScalePlugin::loop", 8192, this, 1, &taskHandle, 0);
 }
 
-void BLEScalePlugin::loop() {
+void BLEScalePlugin::serviceTask(void *arg) {
+    auto *plugin = static_cast<BLEScalePlugin *>(arg);
+    while (true) {
+        plugin->serviceLoop();
+        vTaskDelay(SERVICE_INTERVAL_MS / portTICK_PERIOD_MS);
+    }
+}
+
+void BLEScalePlugin::serviceLoop() {
+    lockScale(portMAX_DELAY);
+    if (disconnectPending) {
+        disconnectPending = false;
+        disconnectLocked();
+    }
     if (doConnect && scale == nullptr) {
         establishConnection();
     }
@@ -127,6 +151,7 @@ void BLEScalePlugin::loop() {
         lastUpdate = now;
         update();
     }
+    unlockScale();
 }
 
 void BLEScalePlugin::update() {
@@ -157,7 +182,7 @@ void BLEScalePlugin::update() {
             reconnectionTries++;
             if (reconnectionTries > RECONNECTION_TRIES) {
                 ESP_LOGW("BLEScalePlugin", "Max reconnection attempts reached, disconnecting");
-                disconnect();
+                disconnectLocked(); // service task already holds scaleMutex
                 if (scanner != nullptr) {
                     scanner->initializeAsyncScan();
                 }
@@ -173,7 +198,10 @@ void BLEScalePlugin::update() {
         for (const auto &d : discoveredScales) {
             if (d.getAddress().toString() == controller->getSettings().getSavedScale().c_str()) {
                 ESP_LOGI("BLEScalePlugin", "Connecting to last known scale");
-                connect(d.getAddress().toString());
+                // Locked variant: the service task already holds scaleMutex, and
+                // the public connect() would self-take it (non-recursive) and drop
+                // the request. No setSavedScale needed - we matched on it above.
+                connectLocked(d.getAddress().toString());
                 break;
             }
         }
@@ -190,9 +218,23 @@ void BLEScalePlugin::connect(const std::string &uuid) {
         return;
     }
 
+    // uuid is read by the service task in establishConnection(); take the mutex
+    // so we're not rewriting the string underneath it. If the task is mid-connect
+    // there is nothing useful to do anyway - that connect attempt wins. Bounded
+    // wait: this runs on the web server's task, which must not stall behind a
+    // blocking BLE connect.
+    if (!lockScale()) {
+        ESP_LOGW("BLEScalePlugin", "Scale busy, connect request to %s dropped", uuid.c_str());
+        return;
+    }
+    connectLocked(uuid);
+    unlockScale();
+    controller->getSettings().setSavedScale(uuid.data());
+}
+
+void BLEScalePlugin::connectLocked(const std::string &uuid) {
     doConnect = true;
     this->uuid = uuid;
-    controller->getSettings().setSavedScale(uuid.data());
 }
 
 void BLEScalePlugin::scan() const {
@@ -207,6 +249,17 @@ void BLEScalePlugin::scan() const {
 }
 
 void BLEScalePlugin::disconnect() {
+    if (!lockScale()) {
+        // Service task is busy (most likely inside a blocking connect). Hand the
+        // work over rather than stalling the caller's task.
+        disconnectPending = true;
+        return;
+    }
+    disconnectLocked();
+    unlockScale();
+}
+
+void BLEScalePlugin::disconnectLocked() {
     if (scale != nullptr) {
         // Add small delay to let any pending callbacks complete
         delay(50);
@@ -236,6 +289,15 @@ void BLEScalePlugin::disconnect() {
 }
 
 void BLEScalePlugin::onProcessStart() const {
+    if (!lockScale()) {
+        ESP_LOGW("BLEScalePlugin", "Scale busy, skipping tare");
+        return;
+    }
+    onProcessStartLocked();
+    unlockScale();
+}
+
+void BLEScalePlugin::onProcessStartLocked() const {
     if (scale != nullptr && scale->isConnected()) {
         // Double tare with validation
         scale->tare();
@@ -322,7 +384,7 @@ void BLEScalePlugin::establishConnection() {
             bool connectResult = scale->connect();
             if (!connectResult) {
                 ESP_LOGW("BLEScalePlugin", "Failed to connect to scale, retrying scan");
-                disconnect();
+                disconnectLocked(); // service task already holds scaleMutex
                 if (scanner != nullptr) {
                     scanner->initializeAsyncScan();
                 }

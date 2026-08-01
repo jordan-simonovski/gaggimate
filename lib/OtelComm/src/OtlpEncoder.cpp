@@ -22,6 +22,28 @@ static_assert(sizeof(otlp_ExportMetricsServiceRequest) <= 60u * 1024u,
 
 namespace otel {
 
+bool hexToBytes(const char *hex, size_t hexLen, uint8_t *out, size_t len) {
+    if (hex == nullptr || hexLen != len * 2)
+        return false;
+    auto value = [](char c) -> int {
+        if (c >= '0' && c <= '9')
+            return c - '0';
+        if (c >= 'a' && c <= 'f')
+            return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F')
+            return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i < hexLen; i++) { // validate before writing anything
+        if (value(hex[i]) < 0)
+            return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        out[i] = static_cast<uint8_t>((value(hex[i * 2]) << 4) | value(hex[i * 2 + 1]));
+    }
+    return true;
+}
+
 namespace {
 
 // Large OTLP request structs live in PSRAM; the export task stack stays small.

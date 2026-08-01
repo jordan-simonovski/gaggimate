@@ -100,6 +100,12 @@ struct SpanData {
     std::vector<SpanEventData> events;
 };
 
+// Parse a W3C-style hex id (trace id: 32 chars, span id: 16) into `len` bytes.
+// Returns false — leaving `out` untouched — unless `hex` is exactly len*2
+// characters and all of them are hex digits, so a malformed or absent id can
+// never be turned into a span pointing at an unrelated trace.
+bool hexToBytes(const char *hex, size_t hexLen, uint8_t *out, size_t len);
+
 class OtlpEncoder {
   public:
     // Encode an ExportMetricsServiceRequest. Returns the encoded byte count, or

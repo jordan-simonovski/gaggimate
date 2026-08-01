@@ -63,6 +63,18 @@
       "default": false,
       "description": "`true` = utility profile (e.g. backflush, flush routines). Utility profiles are excluded from brew-flow treatment at runtime (`BrewProcess::isUtility()` — `src/display/core/process/BrewProcess.h:69`). Set this on non-brew routines like backflush."
     },
+    "grindLevel": {
+      "type": "number",
+      "default": -1,
+      "description": "Grinder setting recorded for the coffee this profile is used with, on the scale of the configured grinder model (`src/display/core/Grinders.h`). A negative value means no grind setting has ever been recorded for this profile, in which case the machine-wide `Settings` value is used instead (`Controller::getGrindLevel()`). Written by the firmware whenever the level is adjusted from the brew screen or the web UI; omitting it on save preserves whatever is already on disk (`ProfileManager::saveProfile()`).",
+      "examples": [-1, 2.5, 18]
+    },
+    "doseWeight": {
+      "type": "number",
+      "default": -1,
+      "description": "Dose in grams recorded for the coffee this profile is used with. A non-positive value means no dose has ever been recorded for this profile, in which case the machine-wide `Settings` value is used instead (`Controller::getDoseWeight()`). Clamped to [0.1, 60.0] on write.",
+      "examples": [-1, 18.0]
+    },
     "phases": {
       "type": "array",
       "minItems": 1,

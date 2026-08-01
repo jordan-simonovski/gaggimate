@@ -174,7 +174,7 @@ bool ProfileManager::loadProfile(const String &uuid, Profile &outProfile) {
     return true;
 }
 
-bool ProfileManager::saveProfile(Profile &profile) {
+bool ProfileManager::saveProfile(Profile &profile, const bool reselect) {
     if (!ensureDirectory())
         return false;
     bool isNew = false;
@@ -186,6 +186,17 @@ bool ProfileManager::saveProfile(Profile &profile) {
 
     ESP_LOGI("ProfileManager", "Saving profile %s", profile.id.c_str());
 
+    // A client (or an older web build) may post profile JSON without the grind
+    // fields. Inherit what is already on disk so an unrelated profile edit
+    // doesn't wipe the grind setting/dose recorded for this coffee.
+    if (!isNew && !profile.hasGrindSettings()) {
+        Profile existing{};
+        if (loadProfile(profile.id, existing) && existing.hasGrindSettings()) {
+            profile.grindLevel = existing.grindLevel;
+            profile.doseWeight = existing.doseWeight;
+        }
+    }
+
     File file = _fs->open(profilePath(profile.id), "w");
     if (!file)
         return false;
@@ -196,6 +207,13 @@ bool ProfileManager::saveProfile(Profile &profile) {
 
     bool ok = serializeJson(doc, file) > 0;
     file.close();
+    if (!reselect) {
+        // Grind flush: `profile` IS selectedProfile and is already the newest
+        // state, so there is nothing to reload. Skipping the reload also avoids
+        // leaving selectedProfile default-constructed (empty phases) across a
+        // filesystem read while the brew path may copy it.
+        return ok;
+    }
     if (profile.id == selectedProfile.id) {
         selectedProfile = Profile{};
         loadSelectedProfile(selectedProfile);
@@ -218,7 +236,21 @@ bool ProfileManager::deleteProfile(const String &uuid) {
 
 bool ProfileManager::profileExists(const String &uuid) { return _fs->exists(profilePath(uuid)); }
 
+void ProfileManager::flushSelected(const bool force) {
+    if (_dirtyAt == 0)
+        return;
+    if (!force && millis() - _dirtyAt < DIRTY_DEBOUNCE_MS)
+        return;
+    if (selectedProfile.id.isEmpty()) {
+        _dirtyAt = 0; // no profile loaded; saving would mint a phantom one
+        return;
+    }
+    _dirtyAt = 0;
+    saveProfile(selectedProfile, false);
+}
+
 void ProfileManager::selectProfile(const String &uuid) {
+    flushSelected(true); // don't lose pending grind edits on the outgoing profile
     ESP_LOGI("ProfileManager", "Selecting profile %s", uuid.c_str());
     _settings.setSelectedProfile(uuid);
     selectedProfile = Profile{};

@@ -11,7 +11,7 @@ import {
   SettingsFormField,
   ToggleField,
 } from '../../components/SettingsFormField.jsx';
-import { grinders } from '../../config/grinders.js';
+import { getGrinders } from '../../config/grinders.js';
 import { timezones } from '../../config/zones.js';
 import { ApiServiceContext, machine } from '../../services/ApiService.js';
 import { DASHBOARD_LAYOUTS, setDashboardLayout } from '../../utils/dashboardManager.js';
@@ -909,7 +909,7 @@ export function Settings() {
                 value={formData.grinderModel ?? 0}
                 onChange={onChange('grinderModel')}
               >
-                {grinders.map((g, idx) => (
+                {getGrinders(formData).map((g, idx) => (
                   <option key={idx} value={idx}>
                     {g.name}
                   </option>

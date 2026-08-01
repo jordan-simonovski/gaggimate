@@ -40,6 +40,10 @@ class OpenTelemetryPlugin : public Plugin {
         bool puckResistanceValid = false;
         float weight = 0.0f;
         bool haveWeight = false;
+        // millis() of the last scale reading; 0 until one arrives. Exported as
+        // coffee.scale.sample_age_ms so a laggy/stalled BLE link is visible in
+        // telemetry instead of only being felt on the screen.
+        unsigned long weightMillis = 0;
     };
 
     // One coffee-shot phase, captured live and emitted as a child span of the
@@ -63,6 +67,7 @@ class OpenTelemetryPlugin : public Plugin {
     // keeps its shape without extra HTTP round-trips.
     struct GaugeSample {
         uint64_t timeNanos = 0;
+        unsigned long captureMillis = 0; // for age-of-reading style gauges
         Snapshot snap;
         bool inShot = false;
         uint8_t traceId[16] = {};
@@ -74,6 +79,9 @@ class OpenTelemetryPlugin : public Plugin {
     void onBrewStart();
     void onBrewEnd();
     void onBrewPhase(int index);
+    // A rating saved against a stored shot, emitted as a span on that shot's
+    // trace (parented to the shot span) so taste notes join the shot's data.
+    void onShotRated(Event &event);
 
     static void exportTaskFn(void *arg);
     void exportLoop();
@@ -97,6 +105,7 @@ class OpenTelemetryPlugin : public Plugin {
     }
 
     Controller *controller = nullptr;
+    PluginManager *plugins = nullptr;
 
     SemaphoreHandle_t mutex = nullptr;
     Snapshot snapshot;
@@ -165,9 +174,11 @@ class OpenTelemetryPlugin : public Plugin {
 
     QueueHandle_t spanQueue = nullptr; // holds otel::SpanData*
 
-    // Max timestamped points batched per gauge per export. Must stay <=
-    // otlp.Gauge.data_points in otlp.options (encoder caps to that array). The
-    // sampler derives its cadence so this is never exceeded for any interval.
+    // Max timestamped points batched per gauge per export. This may exceed
+    // otlp.Gauge.data_points (8) because encodeMetrics splits a batch across
+    // several ResourceMetrics messages; the per-message cap is derived from the
+    // generated struct, not from this constant. The sampler derives its cadence
+    // from this so the ring is never exceeded for any export interval.
     static constexpr size_t MAX_GAUGE_POINTS = 20;
     // Floor for the internal sample cadence. Finer than this buys little for the
     // signals we track and just inflates payloads.

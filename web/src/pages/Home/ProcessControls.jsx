@@ -19,7 +19,7 @@ import { faMinus } from '@fortawesome/free-solid-svg-icons/faMinus';
 import { Tooltip } from '../../components/Tooltip.jsx';
 import { MODES } from './utils.js';
 import { ModeTab } from './ModeTab.jsx';
-import { formatGrindLevel, formatBrewRatio } from '../../config/grinders.js';
+import { formatGrindLevel, formatBrewRatio, getGrinder } from '../../config/grinders.js';
 
 const status = computed(() => machine.value.status);
 
@@ -476,7 +476,10 @@ const ProcessControls = props => {
                     </button>
                   </Tooltip>
                   <div className='text-base-content min-w-[80px] text-center text-lg font-bold tabular-nums'>
-                    {formatGrindLevel(status.value.grindLevel, status.value.grinderModel)}
+                    {formatGrindLevel(
+                      status.value.grindLevel,
+                      getGrinder(settings, status.value.grinderModel),
+                    )}
                   </div>
                   <Tooltip content='Increase grind level'>
                     <button
@@ -514,7 +517,8 @@ const ProcessControls = props => {
               </div>
             </div>
             <div className='text-base-content/60 text-sm tabular-nums'>
-              Brew ratio {formatBrewRatio(status.value.targetWeight, status.value.doseWeight) ?? '—'}
+              Brew ratio{' '}
+              {formatBrewRatio(status.value.targetWeight, status.value.doseWeight) ?? '—'}
             </div>
           </div>
         )}

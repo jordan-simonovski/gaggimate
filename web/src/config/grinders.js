@@ -1,34 +1,33 @@
-// Grinder catalogue for the Web UI. Must stay in sync with the firmware copy in
-// src/display/core/Grinders.h (same order = same index/id).
-export const grinders = [
-  { name: 'Custom / Generic', min: 0, max: 100, step: 1, unit: '' },
-  { name: 'Varia VS3', min: 0, max: 20, step: 0.1, unit: '' }, // V2: stepless 0-20 dial
-  { name: 'Niche Zero', min: 0, max: 50, step: 1, unit: '' }, // numbered 0-50 dial
-  { name: 'Eureka Mignon', min: 0, max: 100, step: 1, unit: '' }, // stepless, no printed scale
-  { name: 'DF64 / DF54', min: 0, max: 100, step: 1, unit: '' }, // stepless collar, no printed scale
-  { name: 'Baratza Encore / Encore ESP', min: 1, max: 40, step: 1, unit: '' }, // 40 settings, starts at 1
-  { name: 'Fellow Ode Gen 2', min: 1, max: 11, step: 1, unit: '' }, // 11 numbered settings
-  { name: '1Zpresso (J/JX/K)', min: 0, max: 100, step: 1, unit: 'clicks' }, // click count varies by model
-  { name: 'Comandante C40', min: 0, max: 50, step: 1, unit: 'clicks' },
-  { name: 'Timemore C2/C3', min: 0, max: 36, step: 1, unit: 'clicks' }, // ~36 clicks/rotation
-  { name: 'Mazzer Mini / Super Jolly', min: 0, max: 100, step: 1, unit: '' }, // stepless collar, no printed scale
-];
+// The grinder catalogue lives in the firmware (src/display/core/Grinders.h) and
+// arrives with GET /api/settings as `grinders`, indexed by `grinderModel`. The
+// Web UI deliberately keeps no copy of the table: one source, nothing to drift.
+// Adding a grinder means editing Grinders.h and nothing here.
 
-export function getGrinder(id) {
+// Only used before settings have loaded, or when running the UI without a
+// device attached. Matches index 0 of the firmware table.
+const FALLBACK = [{ name: 'Custom / Generic', min: 0, max: 100, step: 1, unit: '' }];
+
+export function getGrinders(settings) {
+  const list = settings?.grinders;
+  return Array.isArray(list) && list.length > 0 ? list : FALLBACK;
+}
+
+export function getGrinder(settings, id) {
+  const list = getGrinders(settings);
   const idx = Number(id);
-  if (!Number.isFinite(idx) || idx < 0 || idx >= grinders.length) {
-    return grinders[0];
+  if (!Number.isFinite(idx) || idx < 0 || idx >= list.length) {
+    return list[0];
   }
-  return grinders[idx];
+  return list[idx];
 }
 
 // Format a grind level for display, e.g. "12.5" or "8 clicks". Trailing ".0" is
-// stripped so whole numbers stay clean.
-export function formatGrindLevel(value, grinderId) {
-  const g = getGrinder(grinderId);
+// stripped so whole numbers stay clean. Takes a resolved grinder (see
+// getGrinder) so this stays a pure formatter.
+export function formatGrindLevel(value, grinder) {
   const num = Number(value) || 0;
   const text = Number.isInteger(num) ? String(num) : num.toFixed(1);
-  return g.unit ? `${text} ${g.unit}` : text;
+  return grinder?.unit ? `${text} ${grinder.unit}` : text;
 }
 
 // Brew ratio as "1:X" from a yield (or target) weight and the dose. Returns

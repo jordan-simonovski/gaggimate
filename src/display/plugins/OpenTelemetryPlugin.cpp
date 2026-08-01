@@ -35,6 +35,7 @@ static bool clockValid() { return time(nullptr) > 1600000000L; }
 // Lowercase hex of a trace id, matching the value collectors store for the
 // span's trace_id. Used as the coffee.shot.id metric attribute so live samples
 // can be filtered/joined to the shot trace.
+// Inverse of otel::hexToBytes (declared in OtlpEncoder.h).
 static String traceIdHex(const uint8_t *id, size_t len) {
     static const char digits[] = "0123456789abcdef";
     String out;
@@ -48,6 +49,7 @@ static String traceIdHex(const uint8_t *id, size_t len) {
 
 void OpenTelemetryPlugin::setup(Controller *ctrl, PluginManager *pluginManager) {
     controller = ctrl;
+    plugins = pluginManager;
     Settings &settings = controller->getSettings();
     metricsEnabled = settings.isOtelMetrics();
     tracesEnabled = settings.isOtelTraces();
@@ -73,7 +75,7 @@ void OpenTelemetryPlugin::setup(Controller *ctrl, PluginManager *pluginManager) 
     buffer = static_cast<uint8_t *>(heap_caps_malloc(BUFFER_SIZE, MALLOC_CAP_SPIRAM));
     if (buffer == nullptr)
         buffer = static_cast<uint8_t *>(malloc(BUFFER_SIZE));
-    if (mutex == nullptr || buffer == nullptr) {
+    if (mutex == nullptr || buffer == nullptr || spanQueue == nullptr) {
         ESP_LOGE(OTEL_TAG, "Failed to allocate resources; OTel disabled");
         return;
     }
@@ -188,9 +190,11 @@ void OpenTelemetryPlugin::setup(Controller *ctrl, PluginManager *pluginManager) 
 
     auto weightHandler = [this](Event &event) {
         const float v = event.getFloat("value");
+        const unsigned long now = millis();
         lock();
         snapshot.weight = v;
         snapshot.haveWeight = true;
+        snapshot.weightMillis = now;
         if (shotActive && v > maxWeight)
             maxWeight = v;
         unlock();
@@ -206,6 +210,7 @@ void OpenTelemetryPlugin::setup(Controller *ctrl, PluginManager *pluginManager) 
         lock();
         snapshot.weight = 0.0f;
         snapshot.haveWeight = false;
+        snapshot.weightMillis = 0;
         unlock();
     });
 
@@ -213,6 +218,7 @@ void OpenTelemetryPlugin::setup(Controller *ctrl, PluginManager *pluginManager) 
         pluginManager->on("controller:brew:start", [this](Event &) { onBrewStart(); });
         pluginManager->on("controller:brew:end", [this](Event &) { onBrewEnd(); });
         pluginManager->on("controller:brew:phase", [this](Event &event) { onBrewPhase(event.getInt("index")); });
+        pluginManager->on("history:notes:save", [this](Event &event) { onShotRated(event); });
     }
 
     if (metricsEnabled) {
@@ -255,7 +261,10 @@ void OpenTelemetryPlugin::onBrewStart() {
     shotActive = true;
     esp_fill_random(traceId, sizeof(traceId));
     esp_fill_random(spanId, sizeof(spanId));
-    shotStartNanos = nowUnixNanos();
+    // 0 when the wall clock isn't SNTP-synced yet: onBrewEnd() already treats
+    // that as "don't export". Without it a shot straddling the first sync gets a
+    // start stamped near 1970 and an end in the present - a decades-long span.
+    shotStartNanos = clockValid() ? nowUnixNanos() : 0;
     shotStartMillis = millis();
     peakPressure = 0.0f;
     peakFlow = 0.0f;
@@ -395,8 +404,20 @@ void OpenTelemetryPlugin::onBrewEnd() {
     }
 
     if (xQueueSend(spanQueue, &span, 0) != pdTRUE) {
-        delete span; // queue full; drop rather than block the brew thread
+        ESP_LOGW(OTEL_TAG, "Span queue full; dropped shot span (collector slow or unreachable?)");
+        delete span; // drop rather than block the brew thread
         return;
+    }
+
+    // Hand the ids to the shot-history plugin, which stores them alongside the
+    // shot so a rating saved days later links back to this trace. Only after the
+    // span is actually queued, so notes never reference a trace nothing exported.
+    if (plugins != nullptr) {
+        Event traceEvent;
+        traceEvent.id = "otel:shot:trace";
+        traceEvent.setString("traceId", traceIdHex(tid, sizeof(tid)));
+        traceEvent.setString("spanId", traceIdHex(sid, sizeof(sid)));
+        plugins->trigger(traceEvent);
     }
 
     // Child span per phase. A phase ends where the next one starts; the last
@@ -437,6 +458,59 @@ void OpenTelemetryPlugin::onBrewEnd() {
     }
 }
 
+void OpenTelemetryPlugin::onShotRated(Event &event) {
+    uint8_t tid[16];
+    uint8_t parent[8];
+    const String traceHex = event.getString("traceId");
+    const String spanHex = event.getString("spanId");
+    // No usable ids (traces were off when the shot was pulled, or the notes
+    // predate this feature) - nothing to link to, so nothing to emit.
+    if (!otel::hexToBytes(traceHex.c_str(), traceHex.length(), tid, sizeof(tid)) ||
+        !otel::hexToBytes(spanHex.c_str(), spanHex.length(), parent, sizeof(parent)))
+        return;
+    if (!clockValid())
+        return;
+
+    auto *span = new (std::nothrow) otel::SpanData();
+    if (span == nullptr)
+        return;
+    const uint64_t now = nowUnixNanos();
+    memcpy(span->traceId, tid, sizeof(tid));
+    esp_fill_random(span->spanId, sizeof(span->spanId));
+    memcpy(span->parentSpanId, parent, sizeof(parent));
+    span->hasParent = true;
+    span->name = "rating";
+    span->startNanos = now;
+    span->endNanos = now + 1000000ULL; // 1ms: zero-length spans render badly
+    span->statusCode = 1;              // OK
+    span->attributes.push_back(otel::Attribute::str("coffee.shot.history_id", event.getString("id")));
+    span->attributes.push_back(otel::Attribute::integer("coffee.shot.rating", event.getInt("rating")));
+    const String beans = event.getString("beanType");
+    if (!beans.isEmpty())
+        span->attributes.push_back(otel::Attribute::str("coffee.bean.type", beans));
+    const String taste = event.getString("taste");
+    if (!taste.isEmpty())
+        span->attributes.push_back(otel::Attribute::str("coffee.shot.taste", taste));
+    const String grind = event.getString("grindSetting");
+    if (!grind.isEmpty())
+        span->attributes.push_back(otel::Attribute::str("coffee.grind.setting", grind));
+    const String notes = event.getString("notes");
+    if (!notes.isEmpty())
+        span->attributes.push_back(otel::Attribute::str("coffee.shot.notes", notes));
+    const float doseIn = event.getFloat("doseIn");
+    const float doseOut = event.getFloat("doseOut");
+    if (doseIn > 0.0f) {
+        span->attributes.push_back(otel::Attribute::dbl("coffee.dose.weight_g", doseIn));
+        if (doseOut > 0.0f)
+            span->attributes.push_back(otel::Attribute::dbl("coffee.brew.ratio", doseOut / doseIn));
+    }
+    if (doseOut > 0.0f)
+        span->attributes.push_back(otel::Attribute::dbl("coffee.shot.final_weight_g", doseOut));
+
+    if (xQueueSend(spanQueue, &span, 0) != pdTRUE)
+        delete span; // queue full; a rating is not worth blocking the caller for
+}
+
 void OpenTelemetryPlugin::exportTaskFn(void *arg) { static_cast<OpenTelemetryPlugin *>(arg)->exportLoop(); }
 
 void OpenTelemetryPlugin::exportLoop() {
@@ -444,12 +518,14 @@ void OpenTelemetryPlugin::exportLoop() {
     unsigned long lastSample = 0;
     for (;;) {
         if (tracesEnabled) {
+            // One span per tick, not a full drain: each export is a blocking POST
+            // (up to 13s against a dead collector), and a shot queues one span per
+            // phase. Draining them back-to-back would stall gauge sampling for
+            // minutes; this way sampling keeps its turn between spans.
             otel::SpanData *span = nullptr;
-            while (xQueueReceive(spanQueue, &span, 0) == pdTRUE) {
-                if (span != nullptr) {
-                    exportSpan(span);
-                    delete span;
-                }
+            if (xQueueReceive(spanQueue, &span, 0) == pdTRUE && span != nullptr) {
+                exportSpan(span);
+                delete span;
             }
         }
         if (metricsEnabled) {
@@ -477,6 +553,9 @@ void OpenTelemetryPlugin::captureSample() {
     GaugeSample sample;
     sample.timeNanos = nowUnixNanos();
     lock();
+    // Inside the lock: taken outside, a weight arriving between the two reads
+    // would be newer than captureMillis and underflow the age below.
+    sample.captureMillis = millis();
     sample.snap = snapshot;
     sample.inShot = shotActive;
     sample.grindLevel = shotGrindLevel;
@@ -622,6 +701,30 @@ void OpenTelemetryPlugin::exportMetrics() {
         return true;
     });
 
+    // How stale the newest scale reading was at sample time. Near-zero means a
+    // healthy BLE link; a sawtooth climbing into the seconds means the scale
+    // stalled and any weight-based target was running on old data. Doesn't fit
+    // addGauge (which only sees the Snapshot, not when it was captured).
+    {
+        MS ageSeries;
+        ageSeries.name = "coffee.scale.sample_age_ms";
+        ageSeries.unit = "ms";
+        ageSeries.kind = MS::GAUGE;
+        for (size_t i = 0; i < sampleCount; i++) {
+            const GaugeSample &smp = sampleRing[i];
+            if (smp.snap.weightMillis == 0)
+                continue; // no scale reading yet / scale disconnected
+            otel::DataPoint dp;
+            dp.timeNanos = smp.timeNanos;
+            dp.value = smp.captureMillis > smp.snap.weightMillis
+                           ? static_cast<double>(smp.captureMillis - smp.snap.weightMillis)
+                           : 0.0; // saturate: unsigned subtraction must never wrap
+            ageSeries.points.push_back(std::move(dp));
+        }
+        if (!ageSeries.points.empty())
+            metrics.push_back(std::move(ageSeries));
+    }
+
     // Cumulative monotonic counters (Sums): one point at the export instant. The
     // shot/brew counters carry an exemplar to the last completed shot trace; the
     // rest stay attribute-free so their series remain mergeable across reboots.
@@ -706,8 +809,9 @@ bool OpenTelemetryPlugin::sendPost(HTTPClient &http, const uint8_t *body, size_t
 
     const int code = http.POST(const_cast<uint8_t *>(body), len);
     if (code < 200 || code >= 300) {
-        const String resp = http.getString();
-        ESP_LOGW(OTEL_TAG, "OTLP POST failed: HTTP %d, body: %s", code, resp.c_str());
+        // Don't getString() the body: only the status code is acted on, and a
+        // hostile or broken collector could answer with megabytes we'd buffer.
+        ESP_LOGW(OTEL_TAG, "OTLP POST failed: HTTP %d (%d byte response)", code, http.getSize());
         return false;
     }
     ESP_LOGI(OTEL_TAG, "OTLP POST ok: HTTP %d", code);

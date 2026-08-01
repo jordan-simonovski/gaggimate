@@ -85,6 +85,11 @@ void ShotHistoryPlugin::setup(Controller *c, PluginManager *pm) {
     pm->on("controller:volumetric-measurement:bluetooth:change",
            [this](Event const &event) { currentBluetoothWeight = event.getFloat("value"); });
     pm->on("boiler:currentTemperature:change", [this](Event const &event) { currentTemperature = event.getFloat("value"); });
+    // Emitted by the OpenTelemetry plugin when it closes the shot span.
+    pm->on("otel:shot:trace", [this](Event const &event) {
+        strlcpy(currentTraceId, event.getString("traceId").c_str(), sizeof(currentTraceId));
+        strlcpy(currentSpanId, event.getString("spanId").c_str(), sizeof(currentSpanId));
+    });
     pm->on("pump:puck-resistance:change", [this](Event const &event) { currentPuckResistance = event.getFloat("value"); });
     // Initialize rebuild state
     rebuildInProgress = false;
@@ -249,6 +254,8 @@ void ShotHistoryPlugin::record() {
             if (!appendToIndex(indexEntry)) {
                 ESP_LOGE("ShotHistoryPlugin", "CRITICAL: Failed to add completed shot %u to index", indexEntry.id);
             }
+
+            writeInitialNotes();
         }
     }
 }
@@ -272,6 +279,8 @@ void ShotHistoryPlugin::startRecording() {
     currentEstimatedWeight = 0.0f;
     currentBluetoothFlow = 0.0f;
     currentProfileName = controller->getProfileManager()->getSelectedProfile().label;
+    currentTraceId[0] = '\0';
+    currentSpanId[0] = '\0';
     recording = true;
     extendedRecording = false;
     indexEntryCreated = false; // Reset flag for new shot
@@ -405,14 +414,13 @@ void ShotHistoryPlugin::cleanupHistory() {
         int start = fname.lastIndexOf('/') + 1;
         int end = fname.lastIndexOf('.');
         if (end > start) {
-            uint32_t shotId = fname.substring(start, end).toInt();
-            markIndexDeleted(shotId);
+            String shotId = fname.substring(start, end);
+            markIndexDeleted(shotId.toInt());
+            // Notes are stored under the unpadded id, the log under the padded one.
+            fs->remove(notesPath(shotId));
         }
 
-        // Remove .slog and associated .json notes file
         fs->remove(fname);
-        String notesPath = fname.substring(0, fname.lastIndexOf('.')) + ".json";
-        fs->remove(notesPath);
         removed++;
     }
 
@@ -489,7 +497,7 @@ void ShotHistoryPlugin::handleRequest(JsonDocument &request, JsonDocument &respo
             paddedId = "0" + paddedId;
         }
         fs->remove("/h/" + paddedId + ".slog");
-        fs->remove("/h/" + paddedId + ".json");
+        fs->remove(notesPath(id));
 
         // Mark as deleted in index
         markIndexDeleted(id.toInt());
@@ -520,6 +528,29 @@ void ShotHistoryPlugin::handleRequest(JsonDocument &request, JsonDocument &respo
         // Always use updateIndexMetadata - it handles both rating and optional volume
         updateIndexMetadata(id.toInt(), rating, volume);
 
+        // Announce the rating so the OpenTelemetry plugin can emit it as a span
+        // on the shot's own trace (ids were seeded into the notes at shot end).
+        if (pluginManager != nullptr && rating > 0) {
+            // as<String>() serialises non-strings, so an absent field would come
+            // out as the literal "null". Only take real strings.
+            auto field = [&notes](const char *key) -> String {
+                return notes[key].is<const char *>() ? notes[key].as<String>() : String();
+            };
+            Event event;
+            event.id = "history:notes:save";
+            event.setString("id", id);
+            event.setInt("rating", rating);
+            event.setString("traceId", field("traceId"));
+            event.setString("spanId", field("spanId"));
+            event.setString("beanType", field("beanType"));
+            event.setString("taste", field("balanceTaste"));
+            event.setString("grindSetting", field("grindSetting"));
+            event.setString("notes", field("notes"));
+            event.setFloat("doseIn", field("doseIn").toFloat());
+            event.setFloat("doseOut", field("doseOut").toFloat());
+            pluginManager->trigger(event);
+        }
+
         response["msg"] = "Ok";
     } else if (type == "req:history:rebuild") {
         // Rebuild is now handled asynchronously by WebUIPlugin
@@ -528,18 +559,46 @@ void ShotHistoryPlugin::handleRequest(JsonDocument &request, JsonDocument &respo
     }
 }
 
-void ShotHistoryPlugin::saveNotes(const String &id, const JsonDocument &notes) {
-    File file = fs->open("/h/" + id + ".json", FILE_WRITE);
-    if (file) {
-        String notesStr;
-        serializeJson(notes, notesStr);
-        file.print(notesStr);
-        file.close();
+void ShotHistoryPlugin::writeInitialNotes() {
+    const String id = String(currentId.toInt());
+    if (fs->exists(notesPath(id))) {
+        return; // never clobber notes the user already wrote
     }
+
+    JsonDocument notes(&psramAllocator);
+    notes["id"] = id;
+    notes["rating"] = 0;
+    notes["beanType"] = "";
+    notes["doseIn"] = String(controller->getDoseWeight(), 1);
+    const float yield = static_cast<float>(header.finalWeight) / WEIGHT_SCALE;
+    notes["doseOut"] = header.finalWeight > 0 ? String(yield, 1) : "";
+    notes["ratio"] = "";
+    notes["grindSetting"] = String(controller->getGrindLevel(), 1);
+    notes["balanceTaste"] = "balanced";
+    notes["notes"] = "";
+    if (currentTraceId[0] != '\0') {
+        notes["traceId"] = currentTraceId;
+        notes["spanId"] = currentSpanId;
+    }
+    saveNotes(id, notes);
+}
+
+void ShotHistoryPlugin::saveNotes(const String &id, const JsonDocument &notes) {
+    File file = fs->open(notesPath(id), FILE_WRITE);
+    if (!file) {
+        // Now reached automatically for every shot (writeInitialNotes), so a
+        // silent no-op here would quietly cost the shot its trace linkage.
+        ESP_LOGE("ShotHistoryPlugin", "Failed to open %s for writing notes", notesPath(id).c_str());
+        return;
+    }
+    String notesStr;
+    serializeJson(notes, notesStr);
+    file.print(notesStr);
+    file.close();
 }
 
 void ShotHistoryPlugin::loadNotes(const String &id, JsonDocument &notes) {
-    File file = fs->open("/h/" + id + ".json", "r");
+    File file = fs->open(notesPath(id), "r");
     if (file) {
         String notesStr = file.readString();
         file.close();
@@ -875,11 +934,9 @@ void ShotHistoryPlugin::rebuildIndex() {
         }
 
         // Check for notes and extract rating and volume override
-        String notesPath = "/h/" + String(shotId, 10) + ".json";
-        if (fs->exists(notesPath)) {
-            entry.flags |= SHOT_FLAG_HAS_NOTES;
-
-            File notesFile = fs->open(notesPath, "r");
+        String notesFilePath = notesPath(String(shotId, 10));
+        if (fs->exists(notesFilePath)) {
+            File notesFile = fs->open(notesFilePath, "r");
             if (notesFile) {
                 String notesStr = notesFile.readString();
                 notesFile.close();
@@ -887,6 +944,12 @@ void ShotHistoryPlugin::rebuildIndex() {
                 JsonDocument notesDoc(&psramAllocator);
                 if (deserializeJson(notesDoc, notesStr) == DeserializationError::Ok) {
                     entry.rating = notesDoc["rating"].as<uint8_t>();
+                    // Every completed shot now gets a seeded notes file, so file
+                    // existence alone no longer means "the user wrote notes".
+                    // Match updateIndexMetadata: a rating is the marker.
+                    if (entry.rating > 0) {
+                        entry.flags |= SHOT_FLAG_HAS_NOTES;
+                    }
 
                     // Check if user provided a doseOut value to override volume
                     if (notesDoc["doseOut"].is<String>() && !notesDoc["doseOut"].as<String>().isEmpty()) {

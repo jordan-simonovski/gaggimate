@@ -4,6 +4,7 @@
 #include "esp_sntp.h"
 #include <LittleFS.h>
 #include <SD_MMC.h>
+#include <algorithm>
 #include <cmath>
 #include <ctime>
 #include <display/config.h>
@@ -448,6 +449,9 @@ void Controller::loop() {
 
     pluginManager->loop();
 
+    // Persist pending per-profile grind edits once the user stops adjusting.
+    profileManager->flushSelected();
+
     if (screenReady && !initialized) {
         connect();
     }
@@ -583,6 +587,11 @@ void Controller::startProcess(Process *process) {
         return;
     }
     processCompleted = false;
+    // Reset the phase-transition tracker: it compares against the previous
+    // process pointer, and a freshly allocated process can reuse that address,
+    // which would swallow the first "controller:brew:phase" event.
+    brewPhaseProcess = nullptr;
+    brewPhaseIndex = -1;
     this->currentProcess = process;
     applyConnectionPriority(); // shot started -> tight BLE interval
     pluginManager->trigger("controller:process:start");
@@ -677,29 +686,53 @@ void Controller::setTargetGrindVolume(double volume) {
 
 int Controller::getGrinderModel() const { return settings.getGrinderModel(); }
 
-double Controller::getGrindLevel() const { return settings.getGrindLevel(); }
+// Grind level and dose are per-profile (one coffee grinds differently to the
+// next). The Settings values remain the machine-wide default, used by profiles
+// that have never had a grind setting recorded and inherited by new ones.
+double Controller::getGrindLevel() const {
+    const Profile &profile = profileManager->getSelectedProfile();
+    if (profile.grindLevel < 0.0f)
+        return settings.getGrindLevel();
+    // Clamp on read: a profile may hold a level recorded against a different
+    // grinder scale (user switched grinder model after saving it).
+    const GrinderDef &g = getGrinderDef(settings.getGrinderModel());
+    return std::clamp(static_cast<double>(profile.grindLevel), g.min, g.max);
+}
 
 void Controller::setGrindLevel(double level) {
-    Event event = pluginManager->trigger("controller:grindLevel:change", "value", static_cast<float>(level));
-    settings.setGrindLevel(event.getFloat("value"));
+    // Store first, announce second: Settings clamps and snaps to the grinder's
+    // step, and listeners (the brew screen caches this value) must see what was
+    // actually stored, not the raw request. Otherwise holding the button past
+    // the grinder's max leaves the display showing an out-of-range level.
+    settings.setGrindLevel(level);
+    const auto stored = settings.getGrindLevel();
+    profileManager->getSelectedProfile().grindLevel = static_cast<float>(stored);
+    profileManager->markSelectedDirty();
+    pluginManager->trigger("controller:grindLevel:change", "value", static_cast<float>(stored));
     updateLastAction();
 }
 
-void Controller::raiseGrindLevel() { setGrindLevel(settings.getGrindLevel() + getGrinderDef(settings.getGrinderModel()).step); }
+void Controller::raiseGrindLevel() { setGrindLevel(getGrindLevel() + getGrinderDef(settings.getGrinderModel()).step); }
 
-void Controller::lowerGrindLevel() { setGrindLevel(settings.getGrindLevel() - getGrinderDef(settings.getGrinderModel()).step); }
+void Controller::lowerGrindLevel() { setGrindLevel(getGrindLevel() - getGrinderDef(settings.getGrinderModel()).step); }
 
-double Controller::getDoseWeight() const { return settings.getDoseWeight(); }
+double Controller::getDoseWeight() const {
+    const Profile &profile = profileManager->getSelectedProfile();
+    return profile.doseWeight > 0.0f ? profile.doseWeight : settings.getDoseWeight();
+}
 
 void Controller::setDoseWeight(double weight) {
-    Event event = pluginManager->trigger("controller:doseWeight:change", "value", static_cast<float>(weight));
-    settings.setDoseWeight(event.getFloat("value"));
+    settings.setDoseWeight(weight); // clamps to [0.1, 60.0]; announce the stored value
+    const auto stored = settings.getDoseWeight();
+    profileManager->getSelectedProfile().doseWeight = static_cast<float>(stored);
+    profileManager->markSelectedDirty();
+    pluginManager->trigger("controller:doseWeight:change", "value", static_cast<float>(stored));
     updateLastAction();
 }
 
-void Controller::raiseDoseWeight() { setDoseWeight(settings.getDoseWeight() + 0.5); }
+void Controller::raiseDoseWeight() { setDoseWeight(getDoseWeight() + 0.5); }
 
-void Controller::lowerDoseWeight() { setDoseWeight(settings.getDoseWeight() - 0.5); }
+void Controller::lowerDoseWeight() { setDoseWeight(getDoseWeight() - 0.5); }
 
 void Controller::raiseTemp() {
     float temp = getTargetTemp();
@@ -874,13 +907,20 @@ void Controller::activate() {
     }
     delay(200);
     switch (mode) {
-    case MODE_BREW:
-        startProcess(new BrewProcess(profileManager->getSelectedProfile(),
-                                     profileManager->getSelectedProfile().isVolumetric() && isVolumetricAvailable()
-                                         ? ProcessTarget::VOLUMETRIC
-                                         : ProcessTarget::TIME,
-                                     settings.getBrewDelay()));
+    case MODE_BREW: {
+        // One copy, checked once: BrewProcess's constructor does phases.at(0),
+        // which aborts the board on an empty profile. Reading the shared profile
+        // twice could also mix two different states.
+        Profile profile = profileManager->getSelectedProfile();
+        if (profile.phases.empty()) {
+            ESP_LOGE(LOG_TAG, "Refusing to brew: selected profile has no phases");
+            break;
+        }
+        startProcess(new BrewProcess(
+            profile, profile.isVolumetric() && isVolumetricAvailable() ? ProcessTarget::VOLUMETRIC : ProcessTarget::TIME,
+            settings.getBrewDelay()));
         break;
+    }
     case MODE_STEAM:
         startProcess(new SteamProcess(STEAM_SAFETY_DURATION_MS, settings.getSteamPumpPercentage()));
         break;

@@ -3,11 +3,18 @@
 #include "../core/Plugin.h"
 #include "remote_scales.h"
 #include "remote_scales_plugin_registry.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
 
 void on_ble_measurement(float value);
 
 constexpr unsigned long UPDATE_INTERVAL_MS = 1000;
 constexpr unsigned int RECONNECTION_TRIES = 15;
+// How often the dedicated scale task wakes. The scale itself pushes weight via
+// notifications; this cadence only bounds how quickly a connect/reconnect and
+// the driver heartbeat are serviced.
+constexpr unsigned long SERVICE_INTERVAL_MS = 50;
 
 class BLEScalePlugin : public Plugin {
   public:
@@ -15,8 +22,11 @@ class BLEScalePlugin : public Plugin {
     ~BLEScalePlugin();
 
     void setup(Controller *controller, PluginManager *pluginManager) override;
-    void loop() override;
-    ;
+    // No-op: the scale runs on its own task (see serviceTask). Servicing it from
+    // the shared Arduino loop meant a blocking OTA check, an OTA flash or a slow
+    // web request stalled the driver heartbeat for seconds, which stalls the
+    // weight stream the volumetric targets depend on.
+    void loop() override {}
 
     void connect(const std::string &uuid);
     void scan() const;
@@ -66,6 +76,33 @@ class BLEScalePlugin : public Plugin {
     void pollScaleMetadata();
 
     void establishConnection();
+
+    // The `scale` pointer is created/destroyed by the service task but
+    // disconnect()/tare() are also driven from event handlers on other tasks.
+    // scaleMutex serialises those lifecycle transitions; the *Locked variants
+    // assume the caller already holds it. Plain getters (isConnected, getName,
+    // ...) stay unguarded - they were never guarded and only ever read.
+    SemaphoreHandle_t scaleMutex = nullptr;
+    // Bounded by default: the service task can hold the mutex across a blocking
+    // NimBLE connect, and the callers here run on the brew-logic and UI tasks,
+    // which must never stall behind it.
+    static constexpr TickType_t SCALE_LOCK_WAIT = pdMS_TO_TICKS(250);
+    bool lockScale(TickType_t wait = SCALE_LOCK_WAIT) const {
+        return scaleMutex == nullptr || xSemaphoreTake(scaleMutex, wait) == pdTRUE;
+    }
+    void unlockScale() const {
+        if (scaleMutex)
+            xSemaphoreGive(scaleMutex);
+    }
+    // Set when disconnect() couldn't take the mutex; the service task performs
+    // the disconnect on its next tick instead of the caller blocking for it.
+    volatile bool disconnectPending = false;
+    void disconnectLocked();
+    void connectLocked(const std::string &uuid);
+    void onProcessStartLocked() const;
+    void serviceLoop();
+    static void serviceTask(void *arg);
+    TaskHandle_t taskHandle = nullptr;
 
     bool active = false;
     bool doConnect = false;

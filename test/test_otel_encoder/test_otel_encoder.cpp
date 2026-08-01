@@ -235,8 +235,39 @@ static void test_encoder_never_overflows_any_buffer() {
     }
 }
 
+// Shot ratings are emitted as a span on the shot's own trace, using ids read
+// back from a notes file on flash. A malformed/absent id must be rejected
+// outright rather than half-parsed into a span pointing at a random trace.
+static void test_hex_to_bytes_rejects_bad_ids() {
+    uint8_t out[16];
+    memset(out, 0xAA, sizeof(out));
+
+    const char *valid = "0123456789abcdefFEDCBA9876543210";
+    TEST_ASSERT_TRUE(hexToBytes(valid, strlen(valid), out, 16));
+    TEST_ASSERT_EQUAL_UINT8(0x01, out[0]);
+    TEST_ASSERT_EQUAL_UINT8(0xEF, out[7]);
+    TEST_ASSERT_EQUAL_UINT8(0x10, out[15]);
+
+    uint8_t span[8];
+    const char *validSpan = "0011223344556677";
+    TEST_ASSERT_TRUE(hexToBytes(validSpan, strlen(validSpan), span, 8));
+    TEST_ASSERT_EQUAL_UINT8(0x77, span[7]);
+
+    // Rejected inputs must leave the output buffer untouched.
+    memset(out, 0xAA, sizeof(out));
+    TEST_ASSERT_FALSE(hexToBytes("", 0, out, 16));                                  // absent id
+    TEST_ASSERT_FALSE(hexToBytes("0123", 4, out, 16));                              // too short
+    TEST_ASSERT_FALSE(hexToBytes(nullptr, 32, out, 16));                            // no notes field
+    TEST_ASSERT_FALSE(hexToBytes("0123456789abcdefFEDCBA987654321", 31, out, 16));  // odd length
+    TEST_ASSERT_FALSE(hexToBytes("0123456789abcdefFEDCBA98765432zz", 32, out, 16)); // non-hex
+    for (size_t i = 0; i < sizeof(out); i++) {
+        TEST_ASSERT_EQUAL_UINT8(0xAA, out[i]);
+    }
+}
+
 int main(int, char **) {
     UNITY_BEGIN();
+    RUN_TEST(test_hex_to_bytes_rejects_bad_ids);
     RUN_TEST(test_structs_within_nanopb_limit);
     RUN_TEST(test_worst_case_batch_fits_buffer);
     RUN_TEST(test_all_points_survive_chunking);

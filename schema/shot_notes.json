@@ -50,6 +50,16 @@
     "timestamp": {
       "description": "Timestamp when notes were last updated",
       "type": "integer"
+    },
+    "traceId": {
+      "description": "OpenTelemetry trace id of this shot's span, seeded by the firmware at shot completion when tracing is enabled. Round-tripped unchanged by the UI so a rating saved later can be emitted as a span on the same trace.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "spanId": {
+      "description": "OpenTelemetry span id of this shot's span. The rating span is emitted as its child.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{16}$"
     }
   },
   "required": ["id"]
