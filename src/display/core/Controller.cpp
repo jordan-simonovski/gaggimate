@@ -396,6 +396,14 @@ void Controller::setupWifi() {
         if (WiFi.status() == WL_CONNECTED) {
             ESP_LOGI(LOG_TAG, "Connected to %s with IP address %s", settings.getWifiSsid().c_str(),
                      WiFi.localIP().toString().c_str());
+            // Give the STA a link-local IPv6 address so the mDNS responder has an
+            // AAAA record to answer with. Without one it stays silent on AAAA
+            // queries instead of answering "none", and getaddrinfo() -- which
+            // browsers and curl use, and which always asks A + AAAA -- waits out
+            // a ~5s timeout on every <hostname>.local resolution. Measured: A
+            // 1.98s, AAAA 5.02s, both-together 5.01s; by IP the same request is
+            // 50-130ms. IPv6 is already compiled into the core (CONFIG_LWIP_IPV6).
+            WiFi.enableIpV6();
             // These run in the Arduino WiFi event task (small stack). Only flag
             // the change here; loop() fires the plugin events on the main loop so
             // server/mDNS/socket teardown never runs in this callback context.
@@ -444,6 +452,11 @@ void Controller::loop() {
     }
     if (wifiConnectedPending) {
         wifiConnectedPending = false;
+        // Re-apply on every (re)connect: the IPv6 link-local address does not
+        // survive a disconnect, and without it the mDNS responder goes back to
+        // ignoring AAAA queries. Done here rather than in the WiFi event task,
+        // which has a small stack (see setupWifi).
+        WiFi.enableIpV6();
         pluginManager->trigger("controller:wifi:connect", "AP", isApConnection ? 1 : 0);
     }
 

@@ -13,13 +13,42 @@ export default class ApiService {
   socket = null;
   listeners = {};
   reconnectAttempts = 0;
-  maxReconnectDelay = 30000; // Maximum delay of 30 seconds
+  // Capped at 5s, not 30s: the backoff exists to avoid hammering a device that
+  // is off, but a 30s cap means a machine that just rebooted (OTA, watchdog)
+  // leaves the UI dead long enough that every button looks broken.
+  maxReconnectDelay = 5000;
   baseReconnectDelay = 1000; // Start with 1 second delay
   reconnectTimeout = null;
   isConnecting = false;
 
   constructor() {
     console.log('Established websocket connection');
+    this.connect();
+    // Coming back to the tab, or regaining network, is the strongest signal that
+    // a retry is worth making now rather than after the remaining backoff.
+    if (typeof window !== 'undefined') {
+      const retryNow = () => {
+        if (document.visibilityState === 'visible' && !this.isSocketOpen()) {
+          this.reconnectNow();
+        }
+      };
+      window.addEventListener('online', retryNow);
+      document.addEventListener('visibilitychange', retryNow);
+    }
+  }
+
+  isSocketOpen() {
+    return !!this.socket && this.socket.readyState === WebSocket.OPEN;
+  }
+
+  // Drop any pending backoff and reconnect immediately, resetting the escalation
+  // so a user-visible retry doesn't inherit a long delay from earlier failures.
+  reconnectNow() {
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+      this.reconnectTimeout = null;
+    }
+    this.reconnectAttempts = 0;
     this.connect();
   }
 
@@ -51,13 +80,26 @@ export default class ApiService {
   _onOpen() {
     console.log('WebSocket connected successfully');
     this.reconnectAttempts = 0;
+    // A reconnect may already be queued from the close that preceded this open;
+    // leaving it armed would tear down the socket we just established.
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+      this.reconnectTimeout = null;
+    }
     machine.value = {
       ...machine.value,
       connected: true,
     };
   }
 
-  _onClose() {
+  _onClose(event) {
+    // connect() closes any previous socket, and that close fires asynchronously
+    // with this handler still bound to it. Without this guard the dead socket
+    // schedules a reconnect that closes the live one, and the two take turns
+    // forever.
+    if (event?.target && event.target !== this.socket) {
+      return;
+    }
     console.log('WebSocket connection closed');
     machine.value = {
       ...machine.value,
@@ -109,15 +151,20 @@ export default class ApiService {
   }
 
   send(event) {
-    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+    if (this.isSocketOpen()) {
       this.socket.send(JSON.stringify(event));
-    } else {
-      throw new Error('WebSocket is not connected');
+      return;
     }
+    // Someone is present and waiting, so this is the best possible moment to
+    // retry rather than sitting out the remaining backoff. Still throws, so the
+    // failure isn't swallowed.
+    this.reconnectNow();
+    throw new Error('WebSocket is not connected');
   }
 
   async request(data = {}) {
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+    if (!this.isSocketOpen()) {
+      this.reconnectNow();
       throw new Error('WebSocket is not connected');
     }
 

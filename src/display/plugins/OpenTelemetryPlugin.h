@@ -4,7 +4,9 @@
 
 #include "../core/Plugin.h"
 #include <Arduino.h>
+#include <HTTPClient.h>
 #include <OtlpEncoder.h>
+#include <WiFiClientSecure.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
@@ -14,7 +16,6 @@
 class Controller;
 class PluginManager;
 class Event;
-class HTTPClient;
 
 // Ships GaggiMate coffee telemetry to an OTLP/HTTP collector:
 //   * metrics  - periodic gauges (boiler temp/pressure, pump flow, weight, ...)
@@ -200,6 +201,27 @@ class OpenTelemetryPlugin : public Plugin {
     // export task so it never reads controller-owned Strings cross-thread.
     std::vector<otel::Attribute> resourceAttrs;
     String scopeVersion;
+
+    // Owned by the export task only (created on first POST, never touched from
+    // another thread). Kept alive across exports so a steady-state export is a
+    // POST on an already-open socket: no DNS, no TCP connect, no TLS handshake.
+    // That matters far more than it looks - resolving a .local endpoint runs
+    // inside lwIP's tcpip thread, which is the single thread servicing all
+    // networking, so a slow lookup every interval froze the web server too.
+    HTTPClient *http = nullptr;
+    WiFiClient *plainClient = nullptr;
+    WiFiClientSecure *tlsClient = nullptr;
+    String clientBase; // endpoint the persistent client was built for
+    // Consecutive failures -> back off, so an unreachable collector costs one
+    // connect attempt per backoff window instead of one per export interval.
+    unsigned int exportFailures = 0;
+    unsigned long nextAttemptMillis = 0;
+    static constexpr unsigned long MAX_BACKOFF_MS = 300000; // 5 minutes
+    void releaseHttpClient();
+    // Drops the connection, advances the backoff. Every failure path must go
+    // through this, or that path retries at the full export cadence.
+    void recordExportFailure(const char *reason);
+    bool exportBackedOff() const { return nextAttemptMillis != 0 && static_cast<long>(millis() - nextAttemptMillis) < 0; }
 
     TaskHandle_t taskHandle = nullptr;
     uint8_t *buffer = nullptr;

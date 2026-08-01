@@ -10,6 +10,7 @@
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_random.h>
+#include <algorithm>
 #include <cmath>
 #include <ctime>
 #include <new>
@@ -517,7 +518,11 @@ void OpenTelemetryPlugin::exportLoop() {
     unsigned long lastMetric = 0;
     unsigned long lastSample = 0;
     for (;;) {
-        if (tracesEnabled) {
+        // Don't dequeue while backed off: postOtlp() would refuse the POST and
+        // the span would be deleted having never been attempted. Leaving it
+        // queued means it still ships once the collector returns (the queue is
+        // bounded and logs on overflow).
+        if (tracesEnabled && !exportBackedOff()) {
             // One span per tick, not a full drain: each export is a blocking POST
             // (up to 13s against a dead collector), and a shot queues one span per
             // phase. Draining them back-to-back would stall gauge sampling for
@@ -827,32 +832,88 @@ bool OpenTelemetryPlugin::postOtlp(const char *signalPath, const uint8_t *body, 
         ESP_LOGW(OTEL_TAG, "OTLP skipped: endpoint not configured");
         return false;
     }
+    // An unreachable collector must not cost a connect (and, for a .local
+    // endpoint, a tcpip-thread DNS lookup) on every interval.
+    if (exportBackedOff())
+        return false;
+
     const String url = base + signalPath;
     ESP_LOGI(OTEL_TAG, "OTLP POST -> %s (%u bytes)", url.c_str(), static_cast<unsigned>(len));
 
-    HTTPClient http;
-    http.setReuse(false);
-    http.setConnectTimeout(5000);
-    http.setTimeout(8000);
+    // Rebuild the persistent client only when the endpoint changes.
+    if (http == nullptr || clientBase != base) {
+        releaseHttpClient();
+        http = new (std::nothrow) HTTPClient();
+        if (http == nullptr) {
+            recordExportFailure("HTTPClient allocation failed");
+            return false;
+        }
+        // Keep the connection open between exports. Without this every export
+        // re-resolves and reconnects, which is what stalled the whole IP stack.
+        http->setReuse(true);
+        http->setConnectTimeout(5000);
+        http->setTimeout(8000);
+        if (base.startsWith("https://")) {
+            tlsClient = new (std::nothrow) WiFiClientSecure();
+            if (tlsClient == nullptr) {
+                recordExportFailure("WiFiClientSecure allocation failed");
+                return false;
+            }
+            tlsClient->setCACertBundle(x509_crt_imported_bundle_bin_start);
+        } else {
+            plainClient = new (std::nothrow) WiFiClient();
+            if (plainClient == nullptr) {
+                recordExportFailure("WiFiClient allocation failed");
+                return false;
+            }
+        }
+        clientBase = base;
+    }
 
+    // begin() with the full URL keeps the hostname for the Host header and TLS
+    // SNI. Do not substitute a cached IP here: name-based virtual hosts (every
+    // cloud OTLP endpoint) would get the wrong SNI and reject the request.
+    WiFiClient &client = tlsClient != nullptr ? static_cast<WiFiClient &>(*tlsClient) : *plainClient;
     bool ok = false;
-    if (url.startsWith("https://")) {
-        WiFiClientSecure client;
-        client.setCACertBundle(x509_crt_imported_bundle_bin_start);
-        if (http.begin(client, url)) {
-            ok = sendPost(http, body, len);
-            http.end();
-        } else {
-            ESP_LOGW(OTEL_TAG, "OTLP begin() failed for %s", url.c_str());
-        }
+    if (http->begin(client, url)) {
+        ok = sendPost(*http, body, len);
+        http->end(); // with setReuse(true) this returns the socket to the pool
     } else {
-        WiFiClient client;
-        if (http.begin(client, url)) {
-            ok = sendPost(http, body, len);
-            http.end();
-        } else {
-            ESP_LOGW(OTEL_TAG, "OTLP begin() failed for %s", url.c_str());
-        }
+        ESP_LOGW(OTEL_TAG, "OTLP begin() failed for %s", url.c_str());
+    }
+
+    if (ok) {
+        exportFailures = 0;
+        nextAttemptMillis = 0;
+    } else {
+        recordExportFailure("POST failed");
     }
     return ok;
+}
+
+void OpenTelemetryPlugin::recordExportFailure(const char *reason) {
+    // Drop the connection so the next attempt starts clean, then back off.
+    releaseHttpClient();
+    if (exportFailures < 8)
+        exportFailures++;
+    unsigned long backoff = static_cast<unsigned long>(intervalS) * 1000UL * (1UL << exportFailures);
+    if (backoff > MAX_BACKOFF_MS || backoff == 0)
+        backoff = MAX_BACKOFF_MS;
+    nextAttemptMillis = millis() + backoff;
+    if (nextAttemptMillis == 0)
+        nextAttemptMillis = 1; // 0 is the "no backoff" sentinel
+    ESP_LOGW(OTEL_TAG, "OTLP export failed: %s (%u consecutive); next attempt in %lums", reason, exportFailures, backoff);
+}
+
+void OpenTelemetryPlugin::releaseHttpClient() {
+    if (http != nullptr) {
+        http->end();
+        delete http;
+        http = nullptr;
+    }
+    delete plainClient;
+    plainClient = nullptr;
+    delete tlsClient;
+    tlsClient = nullptr;
+    clientBase = "";
 }
